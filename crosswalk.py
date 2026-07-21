@@ -15,19 +15,19 @@ Before starting:
 # │ CELL 1 — Install dependencies                                               │
 # └─────────────────────────────────────────────────────────────────────────────┘
 
-# %pip install requests rapidfuzz pdfplumber pandas tqdm
+# %pip install requests rapidfuzz pdfplumber pandas
 
 
 # ┌─────────────────────────────────────────────────────────────────────────────┐
 # │ CELL 2 — Imports                                                            │
 # └─────────────────────────────────────────────────────────────────────────────┘
 
+import math
 import re
 import requests
 import pdfplumber
 import pandas as pd
 from rapidfuzz import fuzz, process
-from tqdm.auto import tqdm   # used only for the state-level matching loop
 
 
 # ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -39,6 +39,8 @@ API_KEY      = "YOUR_KEY_HERE"
 SEVP_PDF     = r"C:\Users\you\OneDrive\certified-school-list.pdf"
 OUTPUT_CSV   = r"C:\Users\you\OneDrive\sevis_ipeds_crosswalk.csv"
 SCORE_CUTOFF = 85   # 85 = good default; raise to 90 for precision, lower to 80 for recall
+EXACT_MILES  = 1    # <= this many miles apart counts as EXACT for LOCATION_PROXIMITY (same campus/building)
+CLOSE_MILES  = 10   # <= this many miles apart counts as CLOSE (same metro area); farther is FAR
 
 
 # ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -48,7 +50,8 @@ SCORE_CUTOFF = 85   # 85 = good default; raise to 90 for precision, lower to 80 
 def fetch_scorecard(api_key: str) -> pd.DataFrame:
     """
     Fetches all institutions from the College Scorecard API.
-    Returns a DataFrame with UNITID, OPE8_ID, OPE6_ID, name, city, state, zip.
+    Returns a DataFrame with UNITID, OPE8_ID, OPE6_ID, name, city, state, zip,
+    and latitude/longitude (used for geographic fuzzy-match tiebreaking).
     The API paginates at 100 records per page; loops until exhausted.
     """
     base_url = "https://api.data.gov/ed/collegescorecard/v1/schools"
@@ -60,6 +63,8 @@ def fetch_scorecard(api_key: str) -> pd.DataFrame:
         "school.city",
         "school.state",
         "school.zip",
+        "location.lat",
+        "location.lon",
     ])
 
     params = {
@@ -100,6 +105,8 @@ def fetch_scorecard(api_key: str) -> pd.DataFrame:
         "school.city":  "IPEDS_CITY",
         "school.state": "IPEDS_STATE",
         "school.zip":   "IPEDS_ZIP",
+        "location.lat": "IPEDS_LAT",
+        "location.lon": "IPEDS_LON",
     })
 
     # Zero-pad OPE IDs to standard widths
@@ -182,75 +189,83 @@ def normalise(name: str) -> str:
     return re.sub(r"\s+", " ", name).strip()
 
 
-def normalise_zip(z) -> str:
-    """Truncate to first 5 digits, handling 5-digit, hyphenated 9-digit,
-    and run-together 9-digit formats."""
-    if pd.isna(z) or str(z).strip() == "":
-        return ""
-    return str(z).split("-")[0].strip()[:5]
+def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance in miles between two lat/long points."""
+    EARTH_RADIUS_MI = 3958.8
+    lat1, lon1, lat2, lon2 = map(math.radians, (lat1, lon1, lat2, lon2))
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+    return EARTH_RADIUS_MI * 2 * math.asin(math.sqrt(a))
 
 
-def zip_proximity(zip_a: str, zip_b: str, threshold: int = 5) -> str:
+def location_proximity(
+    lat_a, lon_a, lat_b, lon_b,
+    exact_miles: float = 1.0,
+    close_miles: float = 10.0,
+):
     """
-    Compares two 5-digit zip strings and returns:
-      "EXACT"   — identical
-      "CLOSE"   — numeric difference <= threshold (default 5)
-      "FAR"     — numeric difference > threshold
-      "UNKNOWN" — one or both zips missing/non-numeric
+    Compares two lat/long points and returns a (tier, distance_miles) tuple:
+      "EXACT"   — <= exact_miles apart (default 1 mi — same campus/building)
+      "CLOSE"   — <= close_miles apart (default 10 mi — same metro area)
+      "FAR"     — farther than close_miles
+      "UNKNOWN" — one or both coordinates missing/non-numeric
 
-    A threshold of 5 catches adjacent zip codes within the same
-    postal district (e.g. a university with multiple zip codes
-    for different buildings or campuses nearby).
+    Sliding scale: distance_miles is returned alongside the tier so the
+    exact gap is visible in the output, not just a bucket label.
     """
-    if not zip_a or not zip_b:
-        return "UNKNOWN"
     try:
-        diff = abs(int(zip_a) - int(zip_b))
-    except ValueError:
-        return "UNKNOWN"
-    if diff == 0:
-        return "EXACT"
-    if diff <= threshold:
-        return "CLOSE"
-    return "FAR"
+        lat_a, lon_a, lat_b, lon_b = float(lat_a), float(lon_a), float(lat_b), float(lon_b)
+    except (TypeError, ValueError):
+        return "UNKNOWN", None
+    if any(pd.isna(v) for v in (lat_a, lon_a, lat_b, lon_b)):
+        return "UNKNOWN", None
+
+    dist = haversine_distance(lat_a, lon_a, lat_b, lon_b)
+    if dist <= exact_miles:
+        return "EXACT", dist
+    if dist <= close_miles:
+        return "CLOSE", dist
+    return "FAR", dist
 
 
 def _empty_match() -> dict:
     return {
-        "MATCH_SCORE":    None,
-        "ZIP_PROXIMITY":  None,
-        "UNITID":         None,
-        "OPE8_ID":        None,
-        "OPE6_ID":        None,
-        "IPEDS_NAME":     None,
-        "IPEDS_CITY":     None,
-        "IPEDS_STATE":    None,
-        "IPEDS_ZIP":      None,
+        "MATCH_SCORE":         None,
+        "LOCATION_PROXIMITY":  None,
+        "DISTANCE_MILES":      None,
+        "UNITID":              None,
+        "OPE8_ID":             None,
+        "OPE6_ID":             None,
+        "IPEDS_NAME":          None,
+        "IPEDS_CITY":          None,
+        "IPEDS_STATE":         None,
+        "IPEDS_LAT":           None,
+        "IPEDS_LON":           None,
     }
 
 
 def _confidence(row) -> str:
     """
-    Confidence tiers using name score + zip proximity:
+    Confidence tiers using name score + geographic proximity:
 
-      HIGH      — score >= 93 AND zip is EXACT
-      MEDIUM    — score >= 93 AND zip is CLOSE or UNKNOWN
-      MEDIUM    — score >= 85 AND zip is EXACT
-      LOW       — score >= 93 AND zip is FAR
-      LOW       — score >= 85 AND zip is CLOSE or UNKNOWN
-      LOW       — score >= 85 AND zip is FAR
+      HIGH      — score >= 93 AND location is EXACT
+      MEDIUM    — score >= 93 AND location is CLOSE or UNKNOWN
+      MEDIUM    — score >= 85 AND location is EXACT
+      LOW       — score >= 93 AND location is FAR
+      LOW       — score >= 85 AND location is CLOSE, FAR, or UNKNOWN
       UNMATCHED — no name match above cutoff
     """
     score    = row["MATCH_SCORE"]
-    zip_prox = row["ZIP_PROXIMITY"]
+    loc_prox = row["LOCATION_PROXIMITY"]
 
     if pd.isna(score):
         return "UNMATCHED"
-    if score >= 93 and zip_prox == "EXACT":
+    if score >= 93 and loc_prox == "EXACT":
         return "HIGH"
-    if score >= 93 and zip_prox in ("CLOSE", "UNKNOWN"):
+    if score >= 93 and loc_prox in ("CLOSE", "UNKNOWN"):
         return "MEDIUM"
-    if score >= 85 and zip_prox == "EXACT":
+    if score >= 85 and loc_prox == "EXACT":
         return "MEDIUM"
     return "LOW"
 
@@ -259,27 +274,34 @@ def build_crosswalk(
     sevp: pd.DataFrame,
     ipeds: pd.DataFrame,
     score_cutoff: int = 85,
-    zip_tiebreak_window: int = 5,
-    zip_proximity_threshold: int = 5,
+    score_tiebreak_window: int = 5,
+    exact_miles: float = 1.0,
+    close_miles: float = 10.0,
 ) -> pd.DataFrame:
     """
-    Blocks on state, fuzzy-matches on name, then uses zip proximity as a
-    tiebreaker when multiple candidates score within zip_tiebreak_window
-    points of the top score.
+    Blocks on state, fuzzy-matches on name, then uses geographic distance
+    (haversine, in miles) as a tiebreaker when multiple candidates score
+    within score_tiebreak_window points of the top name-match score.
+
+    Requires SEVP_LAT/SEVP_LON columns on `sevp` and IPEDS_LAT/IPEDS_LON
+    columns on `ipeds`.
 
     Parameters
     ----------
     score_cutoff : int
         Minimum token_set_ratio score to accept any match (default 85).
-    zip_tiebreak_window : int
+    score_tiebreak_window : int
         Candidates within this many name-score points of the best are
-        eligible for the zip tiebreak (default 5).
-    zip_proximity_threshold : int
-        Maximum numeric zip difference to be considered CLOSE (default 5).
+        eligible for the distance tiebreak (default 5).
+    exact_miles : float
+        Distance at or under which two points count as EXACT (default 1).
+    close_miles : float
+        Distance at or under which two points count as CLOSE (default 10).
     """
     ipeds = ipeds.copy()
     ipeds["_norm"] = ipeds["IPEDS_NAME"].fillna("").apply(normalise)
-    ipeds["_zip5"] = ipeds["IPEDS_ZIP"].apply(normalise_zip)
+    ipeds["IPEDS_LAT"] = pd.to_numeric(ipeds["IPEDS_LAT"], errors="coerce")
+    ipeds["IPEDS_LON"] = pd.to_numeric(ipeds["IPEDS_LON"], errors="coerce")
 
     sevp = sevp.copy()
     sevp["_match_name"] = sevp.apply(
@@ -287,13 +309,16 @@ def build_crosswalk(
         axis=1,
     )
     sevp["_norm"] = sevp["_match_name"].apply(normalise)
-    sevp["_zip5"] = sevp["SEVP_ZIP"].apply(normalise_zip)
+    sevp["SEVP_LAT"] = pd.to_numeric(sevp["SEVP_LAT"], errors="coerce")
+    sevp["SEVP_LON"] = pd.to_numeric(sevp["SEVP_LON"], errors="coerce")
 
     results = []
+    state_groups = sevp.groupby("SEVP_STATE")
+    n_states = sevp["SEVP_STATE"].nunique()
 
-    for state, sevp_group in tqdm(
-        sevp.groupby("SEVP_STATE"), desc="States", unit="state"
-    ):
+    for i, (state, sevp_group) in enumerate(state_groups, start=1):
+        print(f"  Matching state {i}/{n_states}: {state}...", end="\r")
+
         ipeds_state = ipeds[ipeds["IPEDS_STATE"] == state]
         if ipeds_state.empty:
             for _, row in sevp_group.iterrows():
@@ -304,7 +329,7 @@ def build_crosswalk(
         candidate_idx = ipeds_state.index.tolist()
 
         for _, row in sevp_group.iterrows():
-            sevp_zip = row["_zip5"]
+            sevp_lat, sevp_lon = row["SEVP_LAT"], row["SEVP_LON"]
 
             # Step 1: get all candidates above cutoff
             all_matches = process.extract(
@@ -318,30 +343,29 @@ def build_crosswalk(
                 results.append({**row.to_dict(), **_empty_match()})
                 continue
 
-            # Step 2: within the tiebreak window, prefer EXACT zip,
-            # then CLOSE zip, then fall back to top name score
+            # Step 2: within the tiebreak window, prefer EXACT distance,
+            # then CLOSE distance, then fall back to top name score
             best_score = all_matches[0][1]
             window = [
                 (text, score, pos)
                 for text, score, pos in all_matches
-                if best_score - score <= zip_tiebreak_window
+                if best_score - score <= score_tiebreak_window
             ]
 
             exact_winner = None
             close_winner = None
 
-            if sevp_zip:
-                for text, score, pos in window:
-                    ipeds_candidate = ipeds_state.loc[candidate_idx[pos]]
-                    prox = zip_proximity(
-                        sevp_zip,
-                        ipeds_candidate["_zip5"],
-                        threshold=zip_proximity_threshold,
-                    )
-                    if prox == "EXACT" and exact_winner is None:
-                        exact_winner = (score, pos)
-                    elif prox == "CLOSE" and close_winner is None:
-                        close_winner = (score, pos)
+            for _text, score, pos in window:
+                ipeds_candidate = ipeds_state.loc[candidate_idx[pos]]
+                prox, _dist = location_proximity(
+                    sevp_lat, sevp_lon,
+                    ipeds_candidate["IPEDS_LAT"], ipeds_candidate["IPEDS_LON"],
+                    exact_miles=exact_miles, close_miles=close_miles,
+                )
+                if prox == "EXACT" and exact_winner is None:
+                    exact_winner = (score, pos)
+                elif prox == "CLOSE" and close_winner is None:
+                    close_winner = (score, pos)
 
             # Pick best winner in priority order
             if exact_winner is not None:
@@ -351,28 +375,32 @@ def build_crosswalk(
             else:
                 _, final_score, final_pos = all_matches[0]
 
-            ipeds_row  = ipeds_state.loc[candidate_idx[final_pos]]
-            zip_prox   = zip_proximity(
-                sevp_zip,
-                ipeds_row["_zip5"],
-                threshold=zip_proximity_threshold,
+            ipeds_row = ipeds_state.loc[candidate_idx[final_pos]]
+            loc_prox, distance_miles = location_proximity(
+                sevp_lat, sevp_lon,
+                ipeds_row["IPEDS_LAT"], ipeds_row["IPEDS_LON"],
+                exact_miles=exact_miles, close_miles=close_miles,
             )
 
             results.append({
                 **row.to_dict(),
-                "MATCH_SCORE":   final_score,
-                "ZIP_PROXIMITY": zip_prox,
-                "UNITID":        ipeds_row["UNITID"],
-                "OPE8_ID":       ipeds_row["OPE8_ID"],
-                "OPE6_ID":       ipeds_row["OPE6_ID"],
-                "IPEDS_NAME":    ipeds_row["IPEDS_NAME"],
-                "IPEDS_CITY":    ipeds_row["IPEDS_CITY"],
-                "IPEDS_STATE":   ipeds_row["IPEDS_STATE"],
-                "IPEDS_ZIP":     ipeds_row["IPEDS_ZIP"],
+                "MATCH_SCORE":        final_score,
+                "LOCATION_PROXIMITY": loc_prox,
+                "DISTANCE_MILES":     round(distance_miles, 2) if distance_miles is not None else None,
+                "UNITID":             ipeds_row["UNITID"],
+                "OPE8_ID":            ipeds_row["OPE8_ID"],
+                "OPE6_ID":            ipeds_row["OPE6_ID"],
+                "IPEDS_NAME":         ipeds_row["IPEDS_NAME"],
+                "IPEDS_CITY":         ipeds_row["IPEDS_CITY"],
+                "IPEDS_STATE":        ipeds_row["IPEDS_STATE"],
+                "IPEDS_LAT":          ipeds_row["IPEDS_LAT"],
+                "IPEDS_LON":          ipeds_row["IPEDS_LON"],
             })
 
+    print(f"  Matched {n_states}/{n_states} states.        ")
+
     out = pd.DataFrame(results).drop(
-        columns=["_norm", "_match_name", "_zip5"], errors="ignore"
+        columns=["_norm", "_match_name"], errors="ignore"
     )
     out["CONFIDENCE"] = out.apply(_confidence, axis=1)
     return out
@@ -383,13 +411,17 @@ def find_top_candidates(
     ipeds: pd.DataFrame,
     top_n: int = 10,
     score_cutoff: int = 60,
-    zip_proximity_threshold: int = 5,
+    exact_miles: float = 1.0,
+    close_miles: float = 10.0,
 ) -> pd.DataFrame:
     """
     For a list of hard-to-match SEVP schools, returns the top N
-    College Scorecard candidates for each, with zip proximity scored.
+    College Scorecard candidates for each, with geographic distance scored.
     Searches nationally (no state blocking) since weak matches often
     fail because the state field itself is inconsistent.
+
+    Requires SEVP_LAT/SEVP_LON columns on `sevp_schools` and IPEDS_LAT/
+    IPEDS_LON columns on `ipeds`.
 
     Parameters
     ----------
@@ -403,12 +435,13 @@ def find_top_candidates(
     score_cutoff : int
         Lower cutoff than build_crosswalk since we want more candidates
         for manual review (default 60).
-    zip_proximity_threshold : int
-        Passed to zip_proximity (default 5).
+    exact_miles, close_miles : float
+        Passed to location_proximity (defaults 1 and 10).
     """
     ipeds = ipeds.copy()
     ipeds["_norm"] = ipeds["IPEDS_NAME"].fillna("").apply(normalise)
-    ipeds["_zip5"] = ipeds["IPEDS_ZIP"].apply(normalise_zip)
+    ipeds["IPEDS_LAT"] = pd.to_numeric(ipeds["IPEDS_LAT"], errors="coerce")
+    ipeds["IPEDS_LON"] = pd.to_numeric(ipeds["IPEDS_LON"], errors="coerce")
 
     sevp_schools = sevp_schools.copy()
     sevp_schools["_match_name"] = sevp_schools.apply(
@@ -416,14 +449,15 @@ def find_top_candidates(
         axis=1,
     )
     sevp_schools["_norm"] = sevp_schools["_match_name"].apply(normalise)
-    sevp_schools["_zip5"] = sevp_schools["SEVP_ZIP"].apply(normalise_zip)
+    sevp_schools["SEVP_LAT"] = pd.to_numeric(sevp_schools["SEVP_LAT"], errors="coerce")
+    sevp_schools["SEVP_LON"] = pd.to_numeric(sevp_schools["SEVP_LON"], errors="coerce")
 
     all_candidates    = ipeds["_norm"].tolist()
     all_candidate_idx = ipeds.index.tolist()
 
     rows = []
     for _, sevp_row in sevp_schools.iterrows():
-        sevp_zip = sevp_row["_zip5"]
+        sevp_lat, sevp_lon = sevp_row["SEVP_LAT"], sevp_row["SEVP_LON"]
 
         matches = process.extract(
             sevp_row["_norm"],
@@ -436,53 +470,59 @@ def find_top_candidates(
         if not matches:
             # Still write one row so the school appears in output
             rows.append({
-                "SCHOOL_NAME":   sevp_row["SCHOOL_NAME"],
-                "CAMPUS_NAME":   sevp_row["CAMPUS_NAME"],
-                "CAMPUS_ID":     sevp_row["CAMPUS_ID"],
-                "SEVP_CITY":     sevp_row["SEVP_CITY"],
-                "SEVP_STATE":    sevp_row["SEVP_STATE"],
-                "SEVP_ZIP":      sevp_row.get("SEVP_ZIP", ""),
-                "CANDIDATE_RANK": None,
-                "MATCH_SCORE":   None,
-                "ZIP_PROXIMITY": None,
-                "UNITID":        None,
-                "OPE8_ID":       None,
-                "OPE6_ID":       None,
-                "IPEDS_NAME":    None,
-                "IPEDS_CITY":    None,
-                "IPEDS_STATE":   None,
-                "IPEDS_ZIP":     None,
+                "SCHOOL_NAME":         sevp_row["SCHOOL_NAME"],
+                "CAMPUS_NAME":         sevp_row["CAMPUS_NAME"],
+                "CAMPUS_ID":           sevp_row["CAMPUS_ID"],
+                "SEVP_CITY":           sevp_row["SEVP_CITY"],
+                "SEVP_STATE":          sevp_row["SEVP_STATE"],
+                "SEVP_LAT":            sevp_row.get("SEVP_LAT"),
+                "SEVP_LON":            sevp_row.get("SEVP_LON"),
+                "CANDIDATE_RANK":      None,
+                "MATCH_SCORE":         None,
+                "LOCATION_PROXIMITY":  None,
+                "DISTANCE_MILES":      None,
+                "UNITID":              None,
+                "OPE8_ID":             None,
+                "OPE6_ID":             None,
+                "IPEDS_NAME":          None,
+                "IPEDS_CITY":          None,
+                "IPEDS_STATE":         None,
+                "IPEDS_LAT":           None,
+                "IPEDS_LON":           None,
             })
             continue
 
         for rank, (_, score, pos) in enumerate(matches, start=1):
             ipeds_row = ipeds.loc[all_candidate_idx[pos]]
-            zip_prox  = zip_proximity(
-                sevp_zip,
-                ipeds_row["_zip5"],
-                threshold=zip_proximity_threshold,
+            loc_prox, distance_miles = location_proximity(
+                sevp_lat, sevp_lon,
+                ipeds_row["IPEDS_LAT"], ipeds_row["IPEDS_LON"],
+                exact_miles=exact_miles, close_miles=close_miles,
             )
             rows.append({
-                "SCHOOL_NAME":    sevp_row["SCHOOL_NAME"],
-                "CAMPUS_NAME":    sevp_row["CAMPUS_NAME"],
-                "CAMPUS_ID":      sevp_row["CAMPUS_ID"],
-                "SEVP_CITY":      sevp_row["SEVP_CITY"],
-                "SEVP_STATE":     sevp_row["SEVP_STATE"],
-                "SEVP_ZIP":       sevp_row.get("SEVP_ZIP", ""),
-                "CANDIDATE_RANK": rank,
-                "MATCH_SCORE":    score,
-                "ZIP_PROXIMITY":  zip_prox,
-                "UNITID":         ipeds_row["UNITID"],
-                "OPE8_ID":        ipeds_row["OPE8_ID"],
-                "OPE6_ID":        ipeds_row["OPE6_ID"],
-                "IPEDS_NAME":     ipeds_row["IPEDS_NAME"],
-                "IPEDS_CITY":     ipeds_row["IPEDS_CITY"],
-                "IPEDS_STATE":    ipeds_row["IPEDS_STATE"],
-                "IPEDS_ZIP":      ipeds_row["IPEDS_ZIP"],
+                "SCHOOL_NAME":         sevp_row["SCHOOL_NAME"],
+                "CAMPUS_NAME":         sevp_row["CAMPUS_NAME"],
+                "CAMPUS_ID":           sevp_row["CAMPUS_ID"],
+                "SEVP_CITY":           sevp_row["SEVP_CITY"],
+                "SEVP_STATE":          sevp_row["SEVP_STATE"],
+                "SEVP_LAT":            sevp_row.get("SEVP_LAT"),
+                "SEVP_LON":            sevp_row.get("SEVP_LON"),
+                "CANDIDATE_RANK":      rank,
+                "MATCH_SCORE":         score,
+                "LOCATION_PROXIMITY":  loc_prox,
+                "DISTANCE_MILES":      round(distance_miles, 2) if distance_miles is not None else None,
+                "UNITID":              ipeds_row["UNITID"],
+                "OPE8_ID":             ipeds_row["OPE8_ID"],
+                "OPE6_ID":             ipeds_row["OPE6_ID"],
+                "IPEDS_NAME":          ipeds_row["IPEDS_NAME"],
+                "IPEDS_CITY":          ipeds_row["IPEDS_CITY"],
+                "IPEDS_STATE":         ipeds_row["IPEDS_STATE"],
+                "IPEDS_LAT":           ipeds_row["IPEDS_LAT"],
+                "IPEDS_LON":           ipeds_row["IPEDS_LON"],
             })
 
     out = pd.DataFrame(rows).drop(
-        columns=["_norm", "_match_name", "_zip5"], errors="ignore"
+        columns=["_norm", "_match_name"], errors="ignore"
     )
     return out
 
@@ -510,6 +550,9 @@ IPEDS_CACHE = r"ipeds.csv"   # change path if you want it saved elsewhere
 
 from pathlib import Path
 
+# NOTE: if you have an older cached ipeds.csv without IPEDS_LAT/IPEDS_LON,
+# delete it (or add those two columns yourself) before running this cell —
+# build_crosswalk requires them.
 if Path(IPEDS_CACHE).exists():
     ipeds_df = pd.read_csv(IPEDS_CACHE, dtype={"OPE8_ID": str, "OPE6_ID": str,
                                                 "UNITID": str, "IPEDS_ZIP": str})
@@ -528,8 +571,11 @@ ipeds_df.head()
 
 SEVP_CACHE = r"sevp.csv"   # change path if you want it saved elsewhere
 
+# NOTE: parse_sevp_pdf() does not produce SEVP_LAT/SEVP_LON — add those two
+# columns to sevp.csv yourself (e.g. by geocoding SEVP_CITY/SEVP_STATE, or
+# a campus address) before running Cell 7. build_crosswalk requires them.
 if Path(SEVP_CACHE).exists():
-    sevp_df = pd.read_csv(SEVP_CACHE, dtype={"CAMPUS_ID": str, "SEVP_ZIP": str})
+    sevp_df = pd.read_csv(SEVP_CACHE, dtype={"CAMPUS_ID": str})
     print(f"Loaded SEVP from cache → {SEVP_CACHE} ({len(sevp_df):,} rows)")
 else:
     sevp_df = parse_sevp_pdf(SEVP_PDF)
@@ -543,7 +589,12 @@ sevp_df.head()
 # │ CELL 7 — Build crosswalk                                                    │
 # └─────────────────────────────────────────────────────────────────────────────┘
 
-crosswalk = build_crosswalk(sevp_df, ipeds_df, score_cutoff=SCORE_CUTOFF)
+crosswalk = build_crosswalk(
+    sevp_df, ipeds_df,
+    score_cutoff=SCORE_CUTOFF,
+    exact_miles=EXACT_MILES,
+    close_miles=CLOSE_MILES,
+)
 print_summary(crosswalk)
 
 
@@ -605,7 +656,8 @@ candidates_df = find_top_candidates(
     ipeds=ipeds_df,
     top_n=10,
     score_cutoff=60,          # lower than main crosswalk to surface more options
-    zip_proximity_threshold=5,
+    exact_miles=EXACT_MILES,
+    close_miles=CLOSE_MILES,
 )
 
 # Save
