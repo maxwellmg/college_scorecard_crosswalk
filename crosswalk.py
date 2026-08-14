@@ -38,10 +38,11 @@ API_KEY      = "YOUR_KEY_HERE"
 # Absolute path recommended for OneDrive/SharePoint environments
 SEVP_PDF     = r"C:\Users\you\OneDrive\certified-school-list.pdf"
 OUTPUT_CSV   = r"C:\Users\you\OneDrive\sevis_ipeds_crosswalk.csv"
-SCORE_CUTOFF   = 85   # min NAME_SCORE (token_set_ratio) for a candidate to be considered at all
-MAX_MILES      = 25   # LATLON_SCORE slides from 100 (0 mi apart) to 0 (>= this many miles apart)
-HIGH_CUTOFF    = 90   # OVERALL_SCORE (avg of NAME/CITY/ZIP/LATLON scores) >= this → CONFIDENCE = HIGH
-MEDIUM_CUTOFF  = 75   # OVERALL_SCORE >= this (but < HIGH_CUTOFF) → CONFIDENCE = MEDIUM; below → LOW
+SCORE_CUTOFF   = 85    # min NAME_SCORE (token_set_ratio) for a candidate to be considered at all
+MAX_MILES      = 25    # LATLON_SCORE slides from 100 (0 mi apart) to 0 (>= this many miles apart)
+ZIP_MAX_DIFF   = 500   # ZIP_SCORE slides from 100 (identical) to 0 (>= this numeric zip difference)
+HIGH_CUTOFF    = 90    # OVERALL_SCORE (avg of NAME/CITY/ZIP/LATLON scores) >= this → CONFIDENCE = HIGH
+MEDIUM_CUTOFF  = 75    # OVERALL_SCORE >= this (but < HIGH_CUTOFF) → CONFIDENCE = MEDIUM; below → LOW
 
 
 # ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -231,12 +232,17 @@ def city_score(city_a, city_b):
     return float(fuzz.token_set_ratio(ca, cb))
 
 
-def zip_score(zip_a, zip_b):
+def zip_score(zip_a, zip_b, max_diff: float = 500.0):
     """
-    Compares two zips (after normalise_zip) and returns a (label, score)
-    tuple:
-      label — "Y" (match), "N" (mismatch), "NA" (one or both missing)
-      score — 100.0, 0.0, or None
+    Compares two 5-digit zips (after normalise_zip) and returns a
+    (label, score) tuple:
+      label — "Y" (exact match), "N" (different), "NA" (one/both missing)
+      score — slides linearly from 100 (identical) down to 0 (numeric
+      difference >= max_diff), same shape as latlon_score's decay.
+
+    Zip codes aren't uniformly spaced geographically, so a numeric
+    difference is only a rough regional-proximity proxy, not a distance —
+    nearby zips are usually (not always) nearby places.
 
     None is excluded from the OVERALL_SCORE average rather than counted
     as a failure — an unverifiable zip shouldn't drag the match down.
@@ -244,7 +250,13 @@ def zip_score(zip_a, zip_b):
     za, zb = normalise_zip(zip_a), normalise_zip(zip_b)
     if not za or not zb:
         return "NA", None
-    return ("Y", 100.0) if za == zb else ("N", 0.0)
+    try:
+        diff = abs(int(za) - int(zb))
+    except ValueError:
+        return "NA", None
+    label = "Y" if diff == 0 else "N"
+    score = max(0.0, 100.0 * (1 - diff / max_diff))
+    return label, score
 
 
 def latlon_score(lat_a, lon_a, lat_b, lon_b, max_miles: float = 25.0):
@@ -270,7 +282,7 @@ def latlon_score(lat_a, lon_a, lat_b, lon_b, max_miles: float = 25.0):
     return dist, score
 
 
-def _score_candidate(name_score: float, sevp_row, ipeds_row, max_miles: float) -> dict:
+def _score_candidate(name_score: float, sevp_row, ipeds_row, max_miles: float, zip_max_diff: float = 500.0) -> dict:
     """
     Computes the four component scores (name/city/zip/latlon) for one
     SEVP-row / IPEDS-candidate pair, plus OVERALL_SCORE — the mean of
@@ -280,7 +292,7 @@ def _score_candidate(name_score: float, sevp_row, ipeds_row, max_miles: float) -
     geocode aren't penalised for it.
     """
     city_sc              = city_score(sevp_row.get("SEVP_CITY"), ipeds_row["IPEDS_CITY"])
-    zip_label, zip_sc     = zip_score(sevp_row.get("SEVP_ZIP"), ipeds_row["IPEDS_ZIP"])
+    zip_label, zip_sc     = zip_score(sevp_row.get("SEVP_ZIP"), ipeds_row["IPEDS_ZIP"], max_diff=zip_max_diff)
     distance_mi, latlon_sc = latlon_score(
         sevp_row.get("SEVP_LAT"), sevp_row.get("SEVP_LON"),
         ipeds_row["IPEDS_LAT"], ipeds_row["IPEDS_LON"],
@@ -347,6 +359,7 @@ def build_crosswalk(
     ipeds: pd.DataFrame,
     score_cutoff: int = 85,
     max_miles: float = 25.0,
+    zip_max_diff: float = 500.0,
     high_cutoff: float = 90,
     medium_cutoff: float = 75,
 ) -> pd.DataFrame:
@@ -372,6 +385,9 @@ def build_crosswalk(
         get a vote; a candidate below this never reaches the composite.
     max_miles : float
         Distance at which LATLON_SCORE bottoms out at 0 (default 25).
+    zip_max_diff : float
+        Numeric zip difference at which ZIP_SCORE bottoms out at 0
+        (default 500).
     high_cutoff, medium_cutoff : float
         OVERALL_SCORE thresholds for CONFIDENCE (defaults 90 and 75).
     """
@@ -382,7 +398,14 @@ def build_crosswalk(
 
     sevp = sevp.copy()
     sevp["_match_name"] = sevp.apply(
-        lambda r: r["CAMPUS_NAME"] if r["CAMPUS_NAME"] else r["SCHOOL_NAME"],
+        # SCHOOL_NAME (the registered institution name) is the primary match
+        # target — it's the direct counterpart to IPEDS_NAME. CAMPUS_NAME is
+        # often just a branch/location label (e.g. a bare city name), and
+        # matching on that alone can produce spurious high name scores
+        # against unrelated schools that happen to share that location name.
+        # Branch-campus disambiguation is handled by CITY_SCORE/LATLON_SCORE
+        # instead, so CAMPUS_NAME is only a fallback when SCHOOL_NAME is blank.
+        lambda r: r["SCHOOL_NAME"] if r["SCHOOL_NAME"] else r["CAMPUS_NAME"],
         axis=1,
     )
     sevp["_norm"] = sevp["_match_name"].apply(normalise)
@@ -426,7 +449,10 @@ def build_crosswalk(
             scored = []
             for _text, name_score, pos in all_matches:
                 ipeds_candidate = ipeds_state.loc[candidate_idx[pos]]
-                scored.append((_score_candidate(name_score, row, ipeds_candidate, max_miles), ipeds_candidate))
+                scored.append((
+                    _score_candidate(name_score, row, ipeds_candidate, max_miles, zip_max_diff=zip_max_diff),
+                    ipeds_candidate,
+                ))
 
             best_scores, best_ipeds_row = max(
                 scored, key=lambda c: (c[0]["OVERALL_SCORE"], c[0]["NAME_SCORE"])
@@ -464,6 +490,7 @@ def find_top_candidates(
     top_n: int = 10,
     score_cutoff: int = 60,
     max_miles: float = 25.0,
+    zip_max_diff: float = 500.0,
 ) -> pd.DataFrame:
     """
     For a list of hard-to-match SEVP schools, returns the top N College
@@ -492,6 +519,8 @@ def find_top_candidates(
         for manual review (default 60).
     max_miles : float
         Passed to latlon_score (default 25).
+    zip_max_diff : float
+        Passed to zip_score (default 500).
     """
     ipeds = ipeds.copy()
     ipeds["_norm"] = ipeds["IPEDS_NAME"].fillna("").apply(normalise)
@@ -500,7 +529,14 @@ def find_top_candidates(
 
     sevp_schools = sevp_schools.copy()
     sevp_schools["_match_name"] = sevp_schools.apply(
-        lambda r: r["CAMPUS_NAME"] if r["CAMPUS_NAME"] else r["SCHOOL_NAME"],
+        # SCHOOL_NAME (the registered institution name) is the primary match
+        # target — it's the direct counterpart to IPEDS_NAME. CAMPUS_NAME is
+        # often just a branch/location label (e.g. a bare city name), and
+        # matching on that alone can produce spurious high name scores
+        # against unrelated schools that happen to share that location name.
+        # Branch-campus disambiguation is handled by CITY_SCORE/LATLON_SCORE
+        # instead, so CAMPUS_NAME is only a fallback when SCHOOL_NAME is blank.
+        lambda r: r["SCHOOL_NAME"] if r["SCHOOL_NAME"] else r["CAMPUS_NAME"],
         axis=1,
     )
     sevp_schools["_norm"] = sevp_schools["_match_name"].apply(normalise)
@@ -538,7 +574,10 @@ def find_top_candidates(
         scored = []
         for _text, name_score, pos in matches:
             ipeds_row = ipeds.loc[all_candidate_idx[pos]]
-            scored.append((_score_candidate(name_score, sevp_row, ipeds_row, max_miles), ipeds_row))
+            scored.append((
+                _score_candidate(name_score, sevp_row, ipeds_row, max_miles, zip_max_diff=zip_max_diff),
+                ipeds_row,
+            ))
 
         # Rank by combined evidence, not raw name score
         scored.sort(key=lambda c: (c[0]["OVERALL_SCORE"], c[0]["NAME_SCORE"]), reverse=True)
@@ -639,6 +678,7 @@ crosswalk = build_crosswalk(
     sevp_df, ipeds_df,
     score_cutoff=SCORE_CUTOFF,
     max_miles=MAX_MILES,
+    zip_max_diff=ZIP_MAX_DIFF,
     high_cutoff=HIGH_CUTOFF,
     medium_cutoff=MEDIUM_CUTOFF,
 )
@@ -706,6 +746,7 @@ candidates_df = find_top_candidates(
     top_n=10,
     score_cutoff=60,          # lower than main crosswalk to surface more options
     max_miles=MAX_MILES,
+    zip_max_diff=ZIP_MAX_DIFF,
 )
 
 # Save
