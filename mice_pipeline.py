@@ -97,8 +97,11 @@ PROTECTED_FROM_VARIANCE_DROP = {
 # Pure identifiers / free text / redundant-with-something-kept fields.
 # Dropped unconditionally, before coverage is even computed — never useful
 # as MICE predictors or targets regardless of how much data they have.
+# NOTE: UNITID is NOT here — see load_raw(), which pulls it out as the
+# DataFrame index instead of dropping it, so it survives as a join key on
+# the other side of MICE (e.g. to attach a dependent variable afterward).
 ALWAYS_EXCLUDE = {
-    "UNITID", "OPEID", "OPEID6", "INSTNM", "CITY", "STABBR", "ZIP",
+    "OPEID", "OPEID6", "INSTNM", "CITY", "STABBR", "ZIP",
     "INSTURL", "NPCURL", "ACCREDCODE",
     "ST_FIPS",           # redundant with REGION, much higher cardinality
     "SCORECARD_SECTOR",  # deterministic function of CONTROL x PREDDEG
@@ -247,6 +250,8 @@ def load_raw(path: str | Path, dictionary_csv: str | Path = DICTIONARY_CSV) -> p
     df, n_renamed = rename_to_flat_convention(df, dotted_to_flat)
     print(f"Renamed {n_renamed} dotted-convention column(s) to the flat convention "
           f"(0 is expected/harmless if the input file is already flat-named).")
+    if "UNITID" in df.columns:
+        df = df.set_index("UNITID")
     df = df.drop(columns=[c for c in ALWAYS_EXCLUDE if c in df.columns])
     return df
 
@@ -547,7 +552,7 @@ def main():
 
     kernel, completed = run_mice(df, rank_maps, report["columns"])
     for i, d in enumerate(completed):
-        d.to_csv(OUTPUT_DIR / f"completed_{i}.csv", index=False)
+        d.to_csv(OUTPUT_DIR / f"completed_{i}.csv", index=True)  # index=UNITID — needed to join a DV on afterward
     kernel.save_kernel(str(OUTPUT_DIR / "mice_kernel.pkl"))
 
     print(f"Wrote {N_DATASETS} completed datasets to {OUTPUT_DIR}/")
