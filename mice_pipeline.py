@@ -74,7 +74,15 @@ APPLY_COVERAGE_FILTER = True
 # with 0-1 examples of a class can segfault rather than error cleanly,
 # especially on Windows). Tune down if you'd rather keep more borderline
 # columns; tune up if warnings/crashes persist.
+#
+# This is an absolute floor, which is easy to under-shoot on a smaller
+# dataset: 20 rows is 0.5% of a 3,704-row panel but 0.02% of a 100,000-row
+# one. MIN_CATEGORY_FRACTION sets a relative floor alongside it — the
+# column is dropped if the 2nd-most-common category fails EITHER floor
+# (whichever number is larger for your row count), so the check doesn't
+# quietly loosen as the dataset gets smaller.
 MIN_CATEGORY_COUNT = 20
+MIN_CATEGORY_FRACTION = 0.01   # 1% of rows
 
 # Registered rare-but-meaningful binary flags exempt from that auto-drop —
 # these are expected to be lopsided (e.g. ~100 HBCUs nationally) and dropping
@@ -146,6 +154,14 @@ BINARY_COLS = {
 # so the dtype-based fallback in classify_columns() would otherwise treat
 # them as continuous and hand them to MICE as if ordered.
 NOMINAL_COLS = {"CONTROL", "REGION", "SCHTYPE", "OPEFLAG"}
+
+# These are also exempt from drop_degenerate_columns, for the same reason
+# as the minority-serving flags above: REGION's "U.S. Service Schools" or
+# OPEFLAG's less common Title IV statuses are rare nationally but real,
+# curated categories, not noise — dropping the whole variable over one rare
+# level throws away the other 9 (or however many) good categories to "fix"
+# one, which is a worse trade than just leaving it be.
+PROTECTED_FROM_VARIANCE_DROP |= NOMINAL_COLS
 
 CIP_COLS = [f"CIPCODE{i}" for i in range(1, 7)]
 
@@ -378,30 +394,87 @@ def apply_structural_fixes(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
 # Step 3 — coverage-based column selection ("the magic proportion")
 # ────────────────────────────────────────────────────────────────────────
 
-def drop_degenerate_columns(df: pd.DataFrame, min_category_count: int = MIN_CATEGORY_COUNT) -> tuple[pd.DataFrame, list[str]]:
-    """Drop any non-numeric (nominal/binary-typed-as-object) column whose
-    2nd-most-common realized value has fewer than min_category_count rows —
-    the condition that produces miceforest's "very rare categories" warning
-    and, in the worst case, a LightGBM training crash on a near-empty class.
-    Columns in PROTECTED_FROM_VARIANCE_DROP are exempt (see its docstring).
+def drop_degenerate_columns(
+    df: pd.DataFrame,
+    columns_to_check: list[str],
+    min_category_count: int = MIN_CATEGORY_COUNT,
+    min_category_fraction: float = MIN_CATEGORY_FRACTION,
+) -> tuple[pd.DataFrame, list[str]]:
+    """Drop any column in columns_to_check whose SMALLEST realized category
+    fails EITHER the absolute or the relative-to-row-count floor — the
+    condition that produces miceforest's "very rare categories" warning
+    and, in the worst case, a LightGBM training crash on a near-empty
+    class. Columns in PROTECTED_FROM_VARIANCE_DROP are exempt (see its
+    docstring).
 
-    Runs on raw dtypes (object/str/numeric-with-few-uniques), i.e. before
-    finalize_dtypes casts anything to 'category' — this only needs to
-    inspect realized value counts, not final dtype.
+    columns_to_check should be classify_columns()'s "nominal" + "binary"
+    lists ONLY — this check exists because a classification target with a
+    near-empty class can crash LightGBM's classifier training. Ordinal and
+    continuous columns are handled as regression targets instead (see
+    encode_ordinal's docstring for why ordinal is kept numeric rather than
+    categorical), and a regression target has no analogous "empty class"
+    failure mode — a rare value there is just a slightly unusual number,
+    not a degenerate training split. Running this check against ALL columns
+    indiscriminately (an earlier version of this function did, using an
+    nunique-based heuristic to guess which were categorical) will catch
+    small-cardinality ORDINAL columns too and drop a real, safe-to-keep
+    feature for no actual safety benefit — hence taking an explicit column
+    list instead of guessing from dtype/cardinality.
+
+    Checks the smallest category (`counts.iloc[-1]`), not the 2nd-largest:
+    for a binary column those are the same value, but a nominal column with
+    3+ categories could have two comfortably-sized categories and one
+    near-empty one — checking only the runner-up would miss exactly the
+    category causing the problem.
     """
+    required = max(min_category_count, min_category_fraction * len(df))
     dropped = []
-    for col in df.columns:
+    for col in columns_to_check:
         if col in PROTECTED_FROM_VARIANCE_DROP:
             continue
-        if pd.api.types.is_numeric_dtype(df[col]) and df[col].nunique(dropna=True) > 20:
-            continue  # treat as continuous-ish; not the target of this check
         counts = df[col].value_counts(dropna=True)
         if counts.shape[0] < 2:
             dropped.append(col)  # constant or entirely missing — useless either way
             continue
-        if counts.iloc[1] < min_category_count:
+        if counts.iloc[-1] < required:
             dropped.append(col)
     return df.drop(columns=dropped), dropped
+
+
+def report_category_rarity(df: pd.DataFrame, top_n: int = 30) -> pd.DataFrame:
+    """Diagnostic only — not called anywhere in the main pipeline. Run this
+    yourself on the frame build_analysis_frame() returns (after
+    drop_degenerate_columns and finalize_dtypes have already run) to see
+    which SURVIVING nominal/binary columns are closest to the edge, sorted
+    worst-first. This is the fast (pure pandas, no LightGBM) way to check
+    "did tightening the threshold actually help, and by how much" without
+    spending 20 minutes on a real MICE attempt each time you adjust
+    MIN_CATEGORY_COUNT/MIN_CATEGORY_FRACTION.
+
+    Checks dtype == 'category' rather than re-guessing from cardinality —
+    by the time build_analysis_frame() has returned, finalize_dtypes has
+    already cast exactly the nominal/binary columns to pandas 'category',
+    so this can just ask dtype directly instead of approximating it.
+
+    Example:
+        df, report, rank_maps = build_analysis_frame(RAW_CSV, DICTIONARY_CSV)
+        print(report_category_rarity(df))
+    """
+    rows = []
+    for col in df.columns:
+        series = df[col]
+        if not isinstance(series.dtype, pd.CategoricalDtype):
+            continue
+        counts = series.value_counts(dropna=True)
+        if counts.shape[0] < 2:
+            continue
+        rows.append({
+            "column": col,
+            "smallest_category_count": counts.iloc[-1],
+            "smallest_category_share": counts.iloc[-1] / counts.sum(),
+            "n_categories": counts.shape[0],
+        })
+    return pd.DataFrame(rows).sort_values("smallest_category_count").head(top_n)
 
 
 def select_by_coverage(df: pd.DataFrame, threshold: float) -> tuple[pd.DataFrame, pd.Series]:
@@ -543,9 +616,18 @@ def build_analysis_frame(
     else:
         dropped = pd.Series(dtype=float)
 
-    df, dropped_degenerate = drop_degenerate_columns(df)
-
+    # Classify BEFORE the degenerate-category check, not after: that check
+    # only makes sense for columns headed for classification (nominal/
+    # binary) — an ordinal column with a rare rank isn't a crash risk the
+    # same way a classification target with a near-empty class is (see
+    # drop_degenerate_columns' docstring), so it needs the classification
+    # split to know which columns to even look at.
     columns = classify_columns(df)
+    df, dropped_degenerate = drop_degenerate_columns(df, columns["nominal"] + columns["binary"])
+    dropped_degenerate_set = set(dropped_degenerate)
+    columns["nominal"] = [c for c in columns["nominal"] if c not in dropped_degenerate_set]
+    columns["binary"] = [c for c in columns["binary"] if c not in dropped_degenerate_set]
+
     df = finalize_dtypes(df, columns)
     return df, {
         "dropped_for_coverage": dropped,
