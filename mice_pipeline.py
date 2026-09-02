@@ -234,12 +234,24 @@ def rename_to_flat_convention(df: pd.DataFrame, dotted_to_flat: dict[str, str]) 
 # Step 1 — load
 # ────────────────────────────────────────────────────────────────────────
 
-def load_raw(path: str | Path, dictionary_csv: str | Path = DICTIONARY_CSV) -> pd.DataFrame:
+def load_raw(path: str | Path, dictionary_csv: str | Path | None = None) -> pd.DataFrame:
     """Load the extract, normalizing every known missing-value convention
     to real NaN at read time. `NA` is caught by pandas' default na_values;
     `PrivacySuppressed`/`NULL` are added defensively for other Scorecard
     files even though neither occurs in the flat-named extract this was
-    first verified against."""
+    first verified against.
+
+    dictionary_csv defaults to None (resolved to the module-level
+    DICTIONARY_CSV below) rather than `= DICTIONARY_CSV` directly in the
+    signature: a plain default like that is evaluated once, when this
+    function is first defined, not each time it's called — so editing
+    DICTIONARY_CSV afterward (e.g. in a Jupyter/Spyder session where this
+    module was already imported) would silently have no effect on calls
+    that rely on the default. Resolving it inside the function body means
+    the current value of the module-level constant is always what's used.
+    """
+    if dictionary_csv is None:
+        dictionary_csv = DICTIONARY_CSV
     df = pd.read_csv(
         path,
         na_values=["PrivacySuppressed", "NULL"],
@@ -510,12 +522,19 @@ def run_mice(df: pd.DataFrame, rank_maps: dict[str, dict], columns: dict[str, li
 # ────────────────────────────────────────────────────────────────────────
 
 def build_analysis_frame(
-    raw_csv: str | Path = RAW_CSV,
-    dictionary_csv: str | Path = DICTIONARY_CSV,
+    raw_csv: str | Path | None = None,
+    dictionary_csv: str | Path | None = None,
 ) -> tuple[pd.DataFrame, dict, dict]:
     """Everything up through column classification/typing — no miceforest
     dependency required. Useful on its own to inspect the coverage report
-    and column classification before committing to a MICE run."""
+    and column classification before committing to a MICE run.
+
+    Both paths default to None (resolved to the module-level RAW_CSV /
+    DICTIONARY_CSV below), for the same reason as load_raw() above — see
+    its docstring.
+    """
+    if raw_csv is None:
+        raw_csv = RAW_CSV
     df = load_raw(raw_csv, dictionary_csv)
     df, rank_maps = apply_structural_fixes(df)
 
