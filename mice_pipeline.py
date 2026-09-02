@@ -12,15 +12,27 @@ coverage-based pruning — every domain-specific step below is gated on
 (a handful, or most of them) before or via COVERAGE_THRESHOLD never breaks
 the script. Nothing hardcodes the full 3,308-column layout.
 
+Also handles either of College Scorecard's two column-naming conventions:
+the flat VARIABLE NAME convention (`PREDDEG`, `CONTROL`, `CCBASIC`, as in the
+bulk "Most Recent Cohorts" CSV) or the dotted "developer-friendly name"
+convention historical/API-sourced pulls use instead (`school.degrees_awarded.
+predominant`, `school.ownership`, `school.carnegie_basic`). Every registry
+and function below is written in terms of the flat convention; a dotted
+input file gets renamed to match immediately after load (see
+build_dotted_to_flat/rename_to_flat_convention) so nothing downstream needs
+to know or care which convention the source file used.
+
 Dependencies: pandas, numpy (present), plus `pip install miceforest` for the
 actual imputation step (not installed in this environment — everything up to
 and including column classification has been run against the real
-Most-Recent-Cohorts-Institution.csv to confirm it behaves correctly; the
-`run_mice()` call itself has not been executed here).
+Most-Recent-Cohorts-Institution.csv, and separately against a synthetic
+dotted-convention sample, to confirm both naming conventions behave
+correctly; the `run_mice()` call itself has not been executed here).
 """
 
 from __future__ import annotations
 
+import csv
 import json
 import sys
 from pathlib import Path
@@ -33,6 +45,14 @@ import pandas as pd
 # ────────────────────────────────────────────────────────────────────────
 
 RAW_CSV = "Most-Recent-Cohorts-Institution.csv"
+
+# Path to CollegeScorecardDataDictionary.csv — needed only to translate a
+# dotted-convention input file to the flat convention (see module docstring).
+# Point this at wherever your own copy lives; if RAW_CSV is already
+# flat-named (like Most-Recent-Cohorts-Institution.csv), this file is read
+# but the resulting rename map ends up empty — harmless either way.
+DICTIONARY_CSV = "CollegeScorecardDataDictionary.csv"
+
 OUTPUT_DIR = Path("mice_output")
 
 COVERAGE_THRESHOLD = 0.85   # the "magic proportion" — min non-missing share to keep a column
@@ -44,6 +64,29 @@ RANDOM_STATE = 42
 # spreadsheet) and want to hand this script an already-trimmed CSV —
 # every other step still runs unconditionally on whatever columns arrive.
 APPLY_COVERAGE_FILTER = True
+
+# A categorical column whose 2nd-most-common realized category has fewer
+# than this many rows gets dropped outright (see drop_degenerate_columns).
+# This is what a LightGBM classifier target needs to not be a coin flip
+# away from a class with ~0 training examples — which is what produces
+# both the "very rare categories ... 0.0 probabilities" warning and, in the
+# worst case, a hard crash (miceforest/LightGBM building a training split
+# with 0-1 examples of a class can segfault rather than error cleanly,
+# especially on Windows). Tune down if you'd rather keep more borderline
+# columns; tune up if warnings/crashes persist.
+MIN_CATEGORY_COUNT = 20
+
+# Registered rare-but-meaningful binary flags exempt from that auto-drop —
+# these are expected to be lopsided (e.g. ~100 HBCUs nationally) and dropping
+# them isn't a "make MICE stable" call, it's a "delete real information"
+# call. Unregistered columns (anything not in this doc's domain registries —
+# which is most of a 2,000+ column extract) get no such protection and are
+# dropped if they trip MIN_CATEGORY_COUNT, since there's no domain basis
+# here to judge whether their rarity is meaningful or just noise.
+PROTECTED_FROM_VARIANCE_DROP = {
+    "HBCU", "PBI", "ANNHI", "TRIBAL", "AANAPII", "HSI", "NANTI",
+    "MENONLY", "WOMENONLY",
+}
 
 # ────────────────────────────────────────────────────────────────────────
 # Domain registries — from CollegeScorecardDataDictionary.csv + verification
@@ -141,20 +184,69 @@ RELAFFIL_FAMILY_MAP = {
 
 
 # ────────────────────────────────────────────────────────────────────────
+# Step 0 — naming convention crosswalk (dotted API names <-> flat VARIABLE NAME)
+# ────────────────────────────────────────────────────────────────────────
+
+def build_dotted_to_flat(dictionary_csv: str | Path) -> dict[str, str]:
+    """CollegeScorecardDataDictionary.csv ties the flat VARIABLE NAME
+    (`PREDDEG`) to the dev-category + developer-friendly name pair the API
+    uses instead (`school` + `degrees_awarded.predominant` ->
+    `school.degrees_awarded.predominant`). A `root`-category field has no
+    prefix at all (`UNITID` -> `id`, not `root.id`) — matches how
+    crosswalk.py's own fetch_scorecard() requests fields like `school.name`
+    and bare `id` from the live API. Returns {dotted_name: flat_name} for
+    every VARIABLE NAME row that has a developer-friendly name on file.
+    """
+    dotted_to_flat: dict[str, str] = {}
+    seen: set[str] = set()
+    with open(dictionary_csv, encoding="utf-8-sig") as f:
+        for row in csv.DictReader(f):
+            var = row["VARIABLE NAME"].strip()
+            if not var or var in seen:
+                continue
+            seen.add(var)
+            friendly = row["developer-friendly name"].strip()
+            if not friendly:
+                continue
+            category = row["dev-category"].strip()
+            dotted = friendly if category in ("", "root") else f"{category}.{friendly}"
+            dotted_to_flat[dotted] = var
+    return dotted_to_flat
+
+
+def rename_to_flat_convention(df: pd.DataFrame, dotted_to_flat: dict[str, str]) -> tuple[pd.DataFrame, int]:
+    """No-op on a file that's already flat-named (e.g.
+    Most-Recent-Cohorts-Institution.csv) — none of its columns match a
+    dotted name, so the rename map ends up empty. On a dotted/API-style
+    historical pull, renames every column the dictionary recognizes;
+    anything it doesn't recognize passes through untouched and falls to
+    classify_columns' generic dtype-based fallback like any other
+    unregistered column — a partial dictionary match degrades gracefully
+    rather than breaking the run."""
+    rename_map = {c: dotted_to_flat[c] for c in df.columns if c in dotted_to_flat}
+    return df.rename(columns=rename_map), len(rename_map)
+
+
+# ────────────────────────────────────────────────────────────────────────
 # Step 1 — load
 # ────────────────────────────────────────────────────────────────────────
 
-def load_raw(path: str | Path) -> pd.DataFrame:
+def load_raw(path: str | Path, dictionary_csv: str | Path = DICTIONARY_CSV) -> pd.DataFrame:
     """Load the extract, normalizing every known missing-value convention
     to real NaN at read time. `NA` is caught by pandas' default na_values;
     `PrivacySuppressed`/`NULL` are added defensively for other Scorecard
-    files even though neither occurs in the current extract (verified)."""
+    files even though neither occurs in the flat-named extract this was
+    first verified against."""
     df = pd.read_csv(
         path,
         na_values=["PrivacySuppressed", "NULL"],
         keep_default_na=True,
         low_memory=False,
     )
+    dotted_to_flat = build_dotted_to_flat(dictionary_csv)
+    df, n_renamed = rename_to_flat_convention(df, dotted_to_flat)
+    print(f"Renamed {n_renamed} dotted-convention column(s) to the flat convention "
+          f"(0 is expected/harmless if the input file is already flat-named).")
     df = df.drop(columns=[c for c in ALWAYS_EXCLUDE if c in df.columns])
     return df
 
@@ -269,6 +361,32 @@ def apply_structural_fixes(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
 # Step 3 — coverage-based column selection ("the magic proportion")
 # ────────────────────────────────────────────────────────────────────────
 
+def drop_degenerate_columns(df: pd.DataFrame, min_category_count: int = MIN_CATEGORY_COUNT) -> tuple[pd.DataFrame, list[str]]:
+    """Drop any non-numeric (nominal/binary-typed-as-object) column whose
+    2nd-most-common realized value has fewer than min_category_count rows —
+    the condition that produces miceforest's "very rare categories" warning
+    and, in the worst case, a LightGBM training crash on a near-empty class.
+    Columns in PROTECTED_FROM_VARIANCE_DROP are exempt (see its docstring).
+
+    Runs on raw dtypes (object/str/numeric-with-few-uniques), i.e. before
+    finalize_dtypes casts anything to 'category' — this only needs to
+    inspect realized value counts, not final dtype.
+    """
+    dropped = []
+    for col in df.columns:
+        if col in PROTECTED_FROM_VARIANCE_DROP:
+            continue
+        if pd.api.types.is_numeric_dtype(df[col]) and df[col].nunique(dropna=True) > 20:
+            continue  # treat as continuous-ish; not the target of this check
+        counts = df[col].value_counts(dropna=True)
+        if counts.shape[0] < 2:
+            dropped.append(col)  # constant or entirely missing — useless either way
+            continue
+        if counts.iloc[1] < min_category_count:
+            dropped.append(col)
+    return df.drop(columns=dropped), dropped
+
+
 def select_by_coverage(df: pd.DataFrame, threshold: float) -> tuple[pd.DataFrame, pd.Series]:
     """Keep only columns with >= threshold share of non-missing values,
     measured AFTER apply_structural_fixes (so a Carnegie field's coverage
@@ -358,7 +476,17 @@ def run_mice(df: pd.DataFrame, rank_maps: dict[str, dict], columns: dict[str, li
         num_datasets=N_DATASETS,
         random_state=RANDOM_STATE,
     )
-    kernel.mice(N_ITERATIONS)
+    # verbose=True: if anything ever crashes mid-run again, this prints which
+    # dataset/iteration/variable it was on right before the crash — the
+    # traceback alone doesn't say, since the failure happens inside
+    # LightGBM's C extension, past the point Python could report it.
+    # num_threads=1: LightGBM + OpenMP crashing with a null-pointer access
+    # violation under multithreading is a known failure mode on Windows/
+    # Anaconda in particular. If drop_degenerate_columns() doesn't fully
+    # resolve the crash, this is the next thing to try — slower, but a
+    # useful bisection step to confirm whether it's a threading race rather
+    # than a data problem. Safe to remove once you've confirmed it's stable.
+    kernel.mice(N_ITERATIONS, verbose=True, num_threads=1)
 
     completed = []
     for i in range(N_DATASETS):
@@ -376,11 +504,14 @@ def run_mice(df: pd.DataFrame, rank_maps: dict[str, dict], columns: dict[str, li
 # Orchestration
 # ────────────────────────────────────────────────────────────────────────
 
-def build_analysis_frame(raw_csv: str | Path = RAW_CSV) -> tuple[pd.DataFrame, dict, dict]:
+def build_analysis_frame(
+    raw_csv: str | Path = RAW_CSV,
+    dictionary_csv: str | Path = DICTIONARY_CSV,
+) -> tuple[pd.DataFrame, dict, dict]:
     """Everything up through column classification/typing — no miceforest
     dependency required. Useful on its own to inspect the coverage report
     and column classification before committing to a MICE run."""
-    df = load_raw(raw_csv)
+    df = load_raw(raw_csv, dictionary_csv)
     df, rank_maps = apply_structural_fixes(df)
 
     if APPLY_COVERAGE_FILTER:
@@ -388,9 +519,15 @@ def build_analysis_frame(raw_csv: str | Path = RAW_CSV) -> tuple[pd.DataFrame, d
     else:
         dropped = pd.Series(dtype=float)
 
+    df, dropped_degenerate = drop_degenerate_columns(df)
+
     columns = classify_columns(df)
     df = finalize_dtypes(df, columns)
-    return df, {"dropped_for_coverage": dropped, "columns": columns}, rank_maps
+    return df, {
+        "dropped_for_coverage": dropped,
+        "dropped_for_low_variance": dropped_degenerate,
+        "columns": columns,
+    }, rank_maps
 
 
 def main():
@@ -400,10 +537,12 @@ def main():
 
     print(f"Columns kept: {df.shape[1]}  |  rows: {df.shape[0]}")
     print(f"Columns dropped for coverage < {COVERAGE_THRESHOLD:.0%}: {len(report['dropped_for_coverage'])}")
+    print(f"Columns dropped for a category with < {MIN_CATEGORY_COUNT} rows: {len(report['dropped_for_low_variance'])}")
     for kind, cols in report["columns"].items():
         print(f"  {kind}: {len(cols)}")
 
     report["dropped_for_coverage"].to_csv(OUTPUT_DIR / "dropped_for_coverage.csv", header=["coverage"])
+    (OUTPUT_DIR / "dropped_for_low_variance.json").write_text(json.dumps(report["dropped_for_low_variance"], indent=2))
     (OUTPUT_DIR / "column_classification.json").write_text(json.dumps(report["columns"], indent=2))
 
     kernel, completed = run_mice(df, rank_maps, report["columns"])
