@@ -84,6 +84,26 @@ APPLY_COVERAGE_FILTER = True
 MIN_CATEGORY_COUNT = 20
 MIN_CATEGORY_FRACTION = 0.01   # 1% of rows
 
+# The continuous-column analog of MIN_CATEGORY_COUNT/FRACTION: a numeric
+# column where one single value accounts for at least this share of its
+# non-missing rows is dropped (see drop_near_constant_continuous). A
+# classification target with a near-empty class is the failure mode the
+# nominal/binary check above exists for; a regression target that's
+# essentially a constant (near-zero variance) is the analogous risk on the
+# continuous side — not guaranteed to crash the same way, but degenerate
+# enough that it isn't contributing real signal either, and it's cheap
+# insurance against whatever the exact failure condition turns out to be.
+MAX_DOMINANT_VALUE_SHARE = 0.99
+
+# Columns whose name ends with one of these (case-insensitive) are
+# per-variable provenance metadata — e.g. a "<variable>.year_added" column
+# recording which year THAT variable was introduced, not an institutional
+# measurement itself. Real and worth keeping, but has no business being
+# imputed or used as a MICE predictor: it describes the data, not the
+# institution. split_metadata_columns() sets these aside into their own
+# frame rather than dropping them.
+METADATA_COLUMN_SUFFIXES = ("year_added",)
+
 # Registered rare-but-meaningful binary flags exempt from that auto-drop —
 # these are expected to be lopsided (e.g. ~100 HBCUs nationally) and dropping
 # them isn't a "make MICE stable" call, it's a "delete real information"
@@ -285,6 +305,41 @@ def load_raw(path: str | Path, dictionary_csv: str | Path | None = None) -> pd.D
 
 
 # ────────────────────────────────────────────────────────────────────────
+# Step 1b — set aside per-variable metadata columns (e.g. "*_year_added"),
+# then checkpoint the sparsity of whatever's left before MICE sees any of it
+# ────────────────────────────────────────────────────────────────────────
+
+def split_metadata_columns(
+    df: pd.DataFrame, suffixes: tuple[str, ...] = METADATA_COLUMN_SUFFIXES
+) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+    """Pulls out columns matching METADATA_COLUMN_SUFFIXES into their own
+    frame (same UNITID index as the input, so it can be rejoined later)
+    rather than dropping them — they're real, worth keeping, just not
+    modeling variables. Returns (mice_df, metadata_df, metadata_column_names)
+    so what got set aside is visible rather than silent. Matching is a
+    case-insensitive suffix check, so this catches the suffix regardless of
+    whether the column is in the flat or dotted naming convention.
+    """
+    suffixes_lower = tuple(s.lower() for s in suffixes)
+    metadata_cols = [c for c in df.columns if c.lower().endswith(suffixes_lower)]
+    return df.drop(columns=metadata_cols), df[metadata_cols].copy(), metadata_cols
+
+
+def report_sparsity(df: pd.DataFrame, top_n: int | None = None) -> pd.DataFrame:
+    """Coverage (share non-missing) for every column, worst-first. Meant to
+    be run as a checkpoint right after split_metadata_columns and
+    apply_structural_fixes but BEFORE select_by_coverage actually filters
+    anything — so the full distribution is visible and COVERAGE_THRESHOLD
+    can be sanity-checked against it, rather than only ever seeing
+    pass/fail counts after the fact.
+    """
+    coverage = df.notna().mean().sort_values()
+    coverage.name = "coverage"
+    out = coverage.reset_index().rename(columns={"index": "column"})
+    return out.head(top_n) if top_n is not None else out
+
+
+# ────────────────────────────────────────────────────────────────────────
 # Step 2 — domain-specific structural fixes (run BEFORE coverage filtering,
 # so coverage reflects the corrected missingness, not the raw column's)
 # ────────────────────────────────────────────────────────────────────────
@@ -477,6 +532,31 @@ def report_category_rarity(df: pd.DataFrame, top_n: int = 30) -> pd.DataFrame:
     return pd.DataFrame(rows).sort_values("smallest_category_count").head(top_n)
 
 
+def drop_near_constant_continuous(
+    df: pd.DataFrame,
+    continuous_cols: list[str],
+    max_dominant_share: float = MAX_DOMINANT_VALUE_SHARE,
+) -> tuple[pd.DataFrame, list[str]]:
+    """Drop any continuous column where a single value accounts for at
+    least max_dominant_share of its non-missing rows — the regression-target
+    analog of drop_degenerate_columns (see MAX_DOMINANT_VALUE_SHARE's
+    comment for why). Only ever called on columns already classified as
+    continuous — an ordinal column with a dominant rank is fine (it's
+    imputed via the same regression-style path deliberately, and a common
+    rank isn't a training hazard the way a near-empty class is).
+    """
+    required = max_dominant_share
+    dropped = []
+    for col in continuous_cols:
+        counts = df[col].value_counts(dropna=True, normalize=True)
+        if counts.empty:
+            dropped.append(col)  # entirely missing
+            continue
+        if counts.iloc[0] >= required:
+            dropped.append(col)
+    return df.drop(columns=dropped), dropped
+
+
 def select_by_coverage(df: pd.DataFrame, threshold: float) -> tuple[pd.DataFrame, pd.Series]:
     """Keep only columns with >= threshold share of non-missing values,
     measured AFTER apply_structural_fixes (so a Carnegie field's coverage
@@ -519,8 +599,26 @@ def classify_columns(df: pd.DataFrame) -> dict[str, list[str]]:
     claimed = set(ordinal_cols) | set(binary_cols) | set(nominal_cols)
     remaining = [c for c in df.columns if c not in claimed]
 
-    continuous_cols = [c for c in remaining if pd.api.types.is_numeric_dtype(df[c])]
-    nominal_cols += [c for c in remaining if c not in continuous_cols]
+    numeric_remaining = [c for c in remaining if pd.api.types.is_numeric_dtype(df[c])]
+
+    # A numeric column with exactly 2 realized values is a binary flag
+    # regardless of whether it's been registered by name — e.g. the ~180
+    # CIP##ASSOC/BACHL/CERT# program-offered flags are plain 0/1 integers
+    # with no individual entry in BINARY_COLS. Left as "continuous" (the
+    # naive numeric-dtype fallback), they'd be handed to MICE as regression
+    # targets AND skip drop_degenerate_columns entirely (which only checks
+    # the nominal+binary lists) — meaning a flag where only a handful of
+    # institutions offer some narrow program would sail through with zero
+    # rare-category protection. This check is deliberately narrow (exactly
+    # 2 values, not "few values") — a genuine small-integer count field
+    # (e.g. NUMBRANCH) can legitimately have low cardinality without being
+    # conceptually binary, and reclassifying those as nominal/binary would
+    # be a much less certain call than this one.
+    newly_binary = [c for c in numeric_remaining if df[c].nunique(dropna=True) == 2]
+    binary_cols += newly_binary
+
+    continuous_cols = [c for c in numeric_remaining if c not in newly_binary]
+    nominal_cols += [c for c in remaining if c not in numeric_remaining]
 
     return {
         "ordinal": ordinal_cols,
@@ -590,6 +688,100 @@ def run_mice(df: pd.DataFrame, rank_maps: dict[str, dict], columns: dict[str, li
     return kernel, completed
 
 
+def find_crashed_variable(exc: BaseException) -> list[str]:
+    """Identifies which variable's LightGBM training was in progress when
+    kernel.mice() crashed, by walking the exception's traceback to find
+    ImputationKernel.mice()'s local `logger` variable and reading its
+    `started_timers` dict.
+
+    This isn't a guess: confirmed against miceforest's actual source
+    (imputation_kernel.py / logger.py). Inside .mice(), immediately before
+    each variable's LightGBM training call, it runs:
+        time_key = dataset, iteration, variable, "Training"
+        logger.set_start_time(time_key)
+        current_model = train(...)          # <- the crash happens here
+        logger.record_time(time_key)        # <- never reached if it crashes
+    `set_start_time` adds time_key to `logger.started_timers`;
+    `record_time` removes it. So at the moment of a crash, exactly one key
+    is left in `started_timers` — the (dataset, iteration, variable, event)
+    tuple for whatever was mid-training. Since miceforest only appends its
+    Logger to kernel.loggers AFTER .mice() returns successfully (see its
+    source), that logger is otherwise unreachable once the exception has
+    propagated — the traceback's stack frames are the only remaining
+    reference to it, which is why this walks tb_frame.f_locals instead of
+    going through the kernel object.
+
+    Returns the variable name(s) still marked "started" (normally exactly
+    one, given num_threads=1 / sequential processing) — empty list if the
+    logger couldn't be found (e.g. miceforest changes this internal
+    structure in a future version).
+    """
+    tb = exc.__traceback__
+    while tb is not None:
+        local_logger = tb.tb_frame.f_locals.get("logger")
+        if local_logger is not None and hasattr(local_logger, "started_timers"):
+            if local_logger.started_timers:
+                return [key[2] for key in local_logger.started_timers]
+        tb = tb.tb_next
+    return []
+
+
+def run_mice_with_retry(
+    df: pd.DataFrame,
+    rank_maps: dict[str, dict],
+    columns: dict[str, list[str]],
+    max_attempts: int = 10,
+):
+    """Stopgap wrapper around run_mice() for while a run still crashes
+    intermittently on some not-yet-identified column: catches an OSError
+    (the access-violation pattern this project has been chasing), uses
+    find_crashed_variable() to identify exactly which column was mid-
+    training, drops it, and retries — up to max_attempts times.
+
+    This is NOT a substitute for drop_degenerate_columns/
+    drop_near_constant_continuous, which are the preventative fix — a
+    column removed here should be treated as a signal that those
+    thresholds (MIN_CATEGORY_COUNT/FRACTION, MAX_DOMINANT_VALUE_SHARE)
+    might need tightening, or that the column deserves a specific look,
+    not just silently accepted. Every column this loop had to remove is
+    returned so that decision stays visible rather than disappearing into
+    a successful-looking run.
+    """
+    working_df = df.copy()
+    working_columns = {k: list(v) for k, v in columns.items()}
+    removed: list[str] = []
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            kernel, completed = run_mice(working_df, rank_maps, working_columns)
+            if removed:
+                print(f"Succeeded after removing {len(removed)} column(s): {removed}")
+            return kernel, completed, removed
+        except OSError as exc:
+            crashed_vars = find_crashed_variable(exc)
+            if not crashed_vars:
+                print("Crash occurred but the crashed variable could not be identified "
+                      "from the logger (see find_crashed_variable's docstring) — "
+                      "stopping automatic retry rather than guessing.")
+                raise
+            print(f"Attempt {attempt}/{max_attempts}: crashed while training "
+                  f"{crashed_vars} — removing and retrying.")
+            for var in crashed_vars:
+                if var not in working_df.columns:
+                    continue
+                working_df = working_df.drop(columns=[var])
+                removed.append(var)
+                for group in working_columns.values():
+                    if var in group:
+                        group.remove(var)
+
+    raise RuntimeError(
+        f"Still crashing after {max_attempts} attempts. Removed so far: {removed}. "
+        "Either raise max_attempts, or this may not be a single-column problem — "
+        "worth checking pip-installed lightgbm/miceforest versions at this point."
+    )
+
+
 # ────────────────────────────────────────────────────────────────────────
 # Orchestration
 # ────────────────────────────────────────────────────────────────────────
@@ -609,7 +801,21 @@ def build_analysis_frame(
     if raw_csv is None:
         raw_csv = RAW_CSV
     df = load_raw(raw_csv, dictionary_csv)
+
+    df, metadata_df, metadata_cols = split_metadata_columns(df)
+    if metadata_cols:
+        print(f"Set aside {len(metadata_cols)} per-variable metadata column(s) "
+              f"(matching {METADATA_COLUMN_SUFFIXES}) — excluded from MICE, not deleted; "
+              f"see report['metadata_df'].")
+
     df, rank_maps = apply_structural_fixes(df)
+
+    # Checkpoint: sparsity of the actual MICE candidate set, now that
+    # metadata columns are out and structural fixes have corrected the
+    # missingness (e.g. Carnegie '-2' no longer counted as "present") —
+    # computed BEFORE select_by_coverage decides pass/fail, so the full
+    # distribution is inspectable rather than only the after-the-fact counts.
+    sparsity_report = report_sparsity(df)
 
     if APPLY_COVERAGE_FILTER:
         df, dropped = select_by_coverage(df, COVERAGE_THRESHOLD)
@@ -628,11 +834,18 @@ def build_analysis_frame(
     columns["nominal"] = [c for c in columns["nominal"] if c not in dropped_degenerate_set]
     columns["binary"] = [c for c in columns["binary"] if c not in dropped_degenerate_set]
 
+    df, dropped_near_constant = drop_near_constant_continuous(df, columns["continuous"])
+    dropped_near_constant_set = set(dropped_near_constant)
+    columns["continuous"] = [c for c in columns["continuous"] if c not in dropped_near_constant_set]
+
     df = finalize_dtypes(df, columns)
     return df, {
         "dropped_for_coverage": dropped,
-        "dropped_for_low_variance": dropped_degenerate,
+        "dropped_for_low_variance": dropped_degenerate + dropped_near_constant,
         "columns": columns,
+        "metadata_columns": metadata_cols,
+        "metadata_df": metadata_df,
+        "sparsity_report": sparsity_report,
     }, rank_maps
 
 
@@ -640,6 +853,14 @@ def main():
     OUTPUT_DIR.mkdir(exist_ok=True)
 
     df, report, rank_maps = build_analysis_frame(RAW_CSV)
+
+    if report["metadata_columns"]:
+        print(f"Metadata columns set aside (not modeled, not deleted): {len(report['metadata_columns'])}")
+        report["metadata_df"].to_csv(OUTPUT_DIR / "metadata_columns.csv", index=True)
+
+    print("Sparsity checkpoint (before coverage filtering) — worst 15 of the MICE candidate columns:")
+    print(report["sparsity_report"].head(15).to_string(index=False))
+    report["sparsity_report"].to_csv(OUTPUT_DIR / "sparsity_report.csv", index=False)
 
     print(f"Columns kept: {df.shape[1]}  |  rows: {df.shape[0]}")
     print(f"Columns dropped for coverage < {COVERAGE_THRESHOLD:.0%}: {len(report['dropped_for_coverage'])}")
@@ -651,7 +872,14 @@ def main():
     (OUTPUT_DIR / "dropped_for_low_variance.json").write_text(json.dumps(report["dropped_for_low_variance"], indent=2))
     (OUTPUT_DIR / "column_classification.json").write_text(json.dumps(report["columns"], indent=2))
 
-    kernel, completed = run_mice(df, rank_maps, report["columns"])
+    kernel, completed, removed_by_retry = run_mice_with_retry(df, rank_maps, report["columns"])
+    if removed_by_retry:
+        (OUTPUT_DIR / "dropped_by_crash_retry.json").write_text(json.dumps(removed_by_retry, indent=2))
+        print(f"NOTE: {len(removed_by_retry)} column(s) were removed reactively after crashing "
+              f"mid-run rather than being caught by the preventative filters — see "
+              f"dropped_by_crash_retry.json, and consider whether MIN_CATEGORY_COUNT/"
+              f"MIN_CATEGORY_FRACTION/MAX_DOMINANT_VALUE_SHARE should be tightened.")
+
     for i, d in enumerate(completed):
         d.to_csv(OUTPUT_DIR / f"completed_{i}.csv", index=True)  # index=UNITID — needed to join a DV on afterward
     kernel.save_kernel(str(OUTPUT_DIR / "mice_kernel.pkl"))
