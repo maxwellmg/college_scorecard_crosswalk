@@ -50,7 +50,18 @@ DIAG_DIR.mkdir(exist_ok=True)
 
 faulthandler.enable()
 
-_original_make_features_label = ImputationKernel._make_features_label
+# Idempotency guard: in a persistent Jupyter kernel, re-running the `import
+# diagnose_mice_crash` cell after editing this file (or via importlib.reload)
+# would otherwise capture the ALREADY-PATCHED method as "_original" on the
+# second pass, silently nesting wrappers. Checking a marker attribute before
+# patching means re-running this module is always safe — you'll only ever
+# get one layer of instrumentation, applied fresh from the real method.
+_already_patched = getattr(ImputationKernel._make_features_label, "_is_diagnostic_patch", False)
+_original_make_features_label = (
+    ImputationKernel._make_features_label.__wrapped__
+    if _already_patched
+    else ImputationKernel._make_features_label
+)
 
 
 def _diagnostic_make_features_label(self, variable, seed):
@@ -85,5 +96,11 @@ def _diagnostic_make_features_label(self, variable, seed):
     return features, label
 
 
+_diagnostic_make_features_label._is_diagnostic_patch = True
+_diagnostic_make_features_label.__wrapped__ = _original_make_features_label
 ImputationKernel._make_features_label = _diagnostic_make_features_label
-print("miceforest instrumented: per-variable diagnostics + faulthandler enabled.")
+
+if _already_patched:
+    print("miceforest instrumentation re-applied (was already patched — replaced cleanly, not stacked).")
+else:
+    print("miceforest instrumented: per-variable diagnostics + faulthandler enabled.")
