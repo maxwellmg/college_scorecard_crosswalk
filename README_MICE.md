@@ -346,3 +346,102 @@ Fixed a more important bug your test run surfaced: the check was running before 
 Extended protection to CONTROL/REGION/SCHTYPE/OPEFLAG (caught REGION getting fully dropped over one rare category — same problem the minority-serving-flag protection already solved, just not extended to these).
 Added report_category_rarity() — a pure-pandas diagnostic you can run on the output of build_analysis_frame() in seconds, to see exactly which columns are closest to the edge without waiting out a 20-minute MICE attempt each time you tune the thresholds.
 Next step: re-run with these fixes. If it still crashes, the single most useful thing you can grab is the exact last variable name printed by verbose=True right before the traceback — that tells us precisely which column's training crashed, since the traceback itself only shows internal LightGBM code, not which variable it was working on. If it does crash again, also worth checking pip show lightgbm miceforest — this specific "access violation reading 0x0" pattern has known open issues in some LightGBM/Windows version combinations, so an upgrade may be the actual fix at that point rather than further data pruning.
+
+
+Confirmed against the actual code — run_mice_with_retry calls run_mice() fresh each attempt, and run_mice() builds a brand-new ImputationKernel from scratch every single time. So each of your 10 attempts really was a fresh kernel — yet every one crashed on its first variable regardless of what that variable's data looked like (a clean binary 0/1 split for DOLPROVIDER, a 3-value ordinal-ish field for SCH_DEG, high-cardinality continuous fields with thousands of unique values for the others). There's no data commonality across these 10 crashes at all.
+
+That's a strong signal this was never about individual columns. The two explanations that fit "always crashes on whatever's first, no matter what it is" are both about the environment, not the data:
+
+A hardware-level access violation can leave the process's native memory in an undefined state. Python catches it and shows you a clean OSError, but that doesn't mean LightGBM's C library recovered cleanly — every subsequent LightGBM call in that same Python process may be doomed regardless of input, which is exactly what 10/10 retries-all-failing-at-position-1 looks like.
+LightGBM itself may be broken/conflicted in this environment (corrupted install, a duplicate lib_lightgbm.dll on the system PATH, antivirus intercepting the native library, an OpenMP mismatch) — independent of miceforest, independent of College Scorecard data entirely.
+Both point to the same next step: test LightGBM completely on its own, outside miceforest, outside any of this project's data, in a fresh kernel restart. This is a 30-second test that will tell us which world we're in.
+
+Write lightgbm_smoke_test.py
+46 lines
+"""
+Minimal LightGBM smoke test — no miceforest, no College Scorecard data.
+
+Why: every crash we've caught so far happens on the FIRST variable trained
+in a given kernel.mice() call, regardless of which variable that is or
+what its data looks like (confirmed across 10 different columns with no
+common profile — continuous, binary, low- and high-cardinality alike). That
+pattern points away from "some column is bad" and toward something about
+the environment/first LightGBM call itself. This script isolates that
+question completely: if THIS crashes too, on 100 rows of made-up numbers
+that have nothing to do with the real dataset, the problem is the LightGBM
+install in this environment, not this project's data or code.
+
+Run this in a FRESH kernel restart (not appended to the notebook that's
+already crashed once — see the module docstring in the parent conversation
+for why a process that already hit a native access violation may not be
+trustworthy for anything run afterward).
+"""
+
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+
+print("lightgbm version:", lgb.__version__)
+
+rng = np.random.default_rng(0)
+n = 200
+X = pd.DataFrame({
+    "a": rng.normal(size=n),
+    "b": rng.integers(0, 5, size=n),
+})
+y = rng.normal(size=n)
+
+print("Building Dataset...")
+train_set = lgb.Dataset(X, label=y)
+
+print("Training...")
+booster = lgb.train(
+    params={"objective": "regression", "verbosity": -1, "num_threads": 1},
+    train_set=train_set,
+    num_boost_round=5,
+)
+
+print("SUCCESS — LightGBM trained a model with no crash.")
+print(booster.predict(X)[:5])
+Let me actually verify this runs correctly rather than just checking syntax — installing the missing OpenMP runtime so I can execute it here first.
+
+Bash
+IN
+brew install libomp 2>&1 | tail -15
+
+OUT
+Error: Your Xcode (12.4) at /Applications/Xcode.app is too outdated.
+
+Please update to Xcode 16.2 (or delete it).
+Xcode can be updated from the App Store.
+Error: Your Command Line Tools are too outdated.
+
+Update them from Software Update in System Settings.
+
+If that doesn't show you any updates, run:
+  sudo rm -rf /Library/Developer/CommandLineTools
+  sudo xcode-select --install
+
+Alternatively, manually download them from:
+  https://developer.apple.com/download/all/.
+You should download the Command Line Tools for Xcode 16.2.
+Bash
+IN
+python3 -m py_compile "/Users/mmg/Desktop/Guidehouse/Work/college_scorecard_crosswalk/lightgbm_smoke_test.py" && echo "syntax OK"
+
+OUT
+syntax OK
+Couldn't execute this end-to-end in my own environment (this sandbox is missing the OpenMP runtime LightGBM needs, and can't install it here due to an outdated Xcode toolchain) — so I can't hand you a "confirmed working" result. But I'm confident in the API surface: lgb.Dataset(data, label=...) and lgb.train(params=..., train_set=..., num_boost_round=...) are the exact same calls visible in your own crash traceback (Booster(params=params, train_set=train_set), and miceforest's own Dataset(data=candidate_features, label=label) — I read that directly from miceforest's source). This test exercises the identical code path that's crashing, just with 200 rows of made-up numbers instead of a real Scorecard column.
+
+How to run it — this part matters: restart your Jupyter kernel first, then run lightgbm_smoke_test.py as the very first thing in that fresh kernel, before touching mice_pipeline.py or any real data. That's important because if the first crash already left this Python process's native memory in a bad state, running the smoke test in the same already-crashed kernel wouldn't tell us anything — it needs a clean process to be a fair test.
+
+What each outcome tells us:
+
+If it crashes too (same OSError: access violation, on 200 rows of random numbers with no relationship to College Scorecard): this conclusively proves it's not your data, not mice_pipeline.py, not miceforest's logic — it's the LightGBM installation itself in this environment. At that point the fix is environment-level, not code-level:
+
+pip uninstall lightgbm then conda install -c conda-forge lightgbm instead — conda-forge's Windows build bundles its own OpenMP runtime and sidesteps the DLL conflicts pip wheels sometimes hit (this is the exact cause cited in a LightGBM GitHub issue I found earlier — the same lib_lightgbm.dll loaded twice from different locations).
+Check whether antivirus / Windows Defender real-time protection is intercepting the native DLL — common on a corporate-managed machine, and a known source of exactly this failure mode.
+Check for a second, conflicting lightgbm install shadowing this one (pip show lightgbm gives one location, but a conda env or another Python install on PATH could have its own copy).
+If it succeeds cleanly: then it really is something specific to how miceforest constructs its per-variable Dataset objects from your actual data (not a broken install) — and the "always position 1" pattern would need a different explanation, most likely that the first crash (whichever one occurs) really does corrupt that process for everything after it, meaning the retry loop's premise (catch-and-continue in the same process) is unsound and needs to become "catch, then retry in a fresh subprocess" rather than a fresh kernel object in the same process. I can build that if it comes to that — it's a bigger change, so I'd rather confirm the smoke test result first than build it speculatively.
+
+Run it and let me know which way it goes.
