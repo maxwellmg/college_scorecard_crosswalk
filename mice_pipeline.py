@@ -272,10 +272,78 @@ def rename_to_flat_convention(df: pd.DataFrame, dotted_to_flat: dict[str, str]) 
 
 def load_raw(path: str | Path, dictionary_csv: str | Path | None = None) -> pd.DataFrame:
     """Load the extract, normalizing every known missing-value convention
-    to real NaN at read time. `NA` is caught by pandas' default na_values;
-    `PrivacySuppressed`/`NULL` are added defensively for other Scorecard
-    files even though neither occurs in the flat-named extract this was
-    first verified against.
+    to real NaN at read time. `NA` is caught by pandas' default na_values.
+    `PrivacySuppressed`/`NULL` are defensive (neither occurs in the flat
+    extract this was first verified against) but `PS` is NOT defensive —
+    it's a real, previously-missed suppression code used across 2,341 of
+    this file's 3,308 columns (8.1M occurrences), mostly in the *_YR2_RT-
+    style cohort completion/transfer/withdrawal rate families, and in the
+    cohort-count/earnings families (`OVERALL_YR2_N`/`_YR3_N`/`_YR4_N`,
+    `MD_EARN_WNE_4YR`, `COUNT_WNE_4YR`, ...).
+
+    THIS IS NOT JUST A COVERAGE-ACCURACY BUG — it is very likely a direct
+    contributor to the miceforest/LightGBM native crashes documented in
+    HANDOFF_MICE_CRASH_DEBUG.md, and should be re-tested against that crash
+    before assuming this project needs the R port
+    (college_scorecard_crosswalk/mice_pipeline.R) instead of this file.
+    Mechanism, confirmed against the real data:
+
+    1. Without this fix, a column like MD_EARN_WNE_4YR (raw dollar
+       earnings) reads as pandas dtype `object`/`str`, not numeric, because
+       "PS" mixed in with numbers defeats pandas' automatic type inference
+       for the whole column — `pd.api.types.is_numeric_dtype()` returns
+       False on it.
+    2. classify_columns()'s fallback (numeric -> continuous, else ->
+       nominal) therefore misroutes it to NOMINAL, not continuous — a
+       purely mechanical dtype check, with no way to know the column is
+       "really" a suppressed-but-otherwise-continuous rate/dollar field.
+    3. finalize_dtypes() then runs it through reduce_cardinality(), which
+       keeps only categories with >= 1% frequency. Confirmed against real
+       data: for MD_EARN_WNE_4YR, "PS" appears 469 times (7.5% of rows,
+       comfortably clears the threshold) while every actual dollar amount
+       appears at most 31 times (0.5%, below it) — so EVERY real value
+       collapses into a single "Other" bucket. A genuinely continuous,
+       information-rich earnings variable becomes a fake 2-level factor:
+       "PS" vs "Other".
+    4. That fake factor then gets handed to LightGBM as a classification
+       target (when it's this variable's turn to be imputed) or as a
+       `categorical_feature` predictor (for every other variable's turn).
+       Because privacy suppression is driven by small cohort size, "PS"
+       fires together across many related cohort/earnings columns for the
+       same (small) institutions at once — so this bug doesn't corrupt one
+       column in isolation, it manufactures a whole cluster of near-
+       identical, spuriously-binary "PS-vs-everything" columns that are
+       highly redundant with each other. That is exactly the kind of
+       degenerate, redundant categorical input this project's crash
+       debugging (drop_degenerate_columns, drop_near_constant_continuous,
+       the retry-with-removal loop) was built to catch and never fully
+       could — because those filters run on the ALREADY-mangled 2-level
+       version of the column, which looks individually well-populated
+       (469 vs ~5,200 rows) and doesn't trip a rarity threshold at all. The
+       real defect was upstream, in what the column WAS before it reached
+       those filters, not in the filters' thresholds.
+
+    Fixing it here, at load time, is what makes columns like
+    MD_EARN_WNE_4YR flow through the rest of this pipeline as the
+    continuous variables they actually are — never becoming a nominal
+    column, never going through reduce_cardinality, never becoming a
+    LightGBM classification target/categorical predictor at all for this
+    reason. Whether this alone resolves the native crash can only be
+    confirmed by re-running run_mice_with_retry() against real data; it
+    removes a definitively confirmed, severe data-corruption bug that
+    affects roughly 70% of this file's columns, which is a stronger and
+    more specific candidate than anything else investigated in
+    HANDOFF_MICE_CRASH_DEBUG.md (a broken LightGBM install, a corrupted
+    process) — but it is a strong hypothesis backed by direct evidence, not
+    a proven fix, since the crash itself could only ever be reproduced on
+    the original Windows environment, not here.
+
+    Separately, this also means every coverage/sparsity number reported by
+    this script in any session before this fix was silently wrong for the
+    ~2,341 affected columns — "PS" was being counted as a present value at
+    every coverage-filtering decision point until this fix moved the
+    normalization to load time instead of a later
+    pd.to_numeric(errors="coerce") cleanup.
 
     dictionary_csv defaults to None (resolved to the module-level
     DICTIONARY_CSV below) rather than `= DICTIONARY_CSV` directly in the
@@ -290,7 +358,7 @@ def load_raw(path: str | Path, dictionary_csv: str | Path | None = None) -> pd.D
         dictionary_csv = DICTIONARY_CSV
     df = pd.read_csv(
         path,
-        na_values=["PrivacySuppressed", "NULL"],
+        na_values=["PrivacySuppressed", "NULL", "PS"],
         keep_default_na=True,
         low_memory=False,
     )
@@ -425,7 +493,18 @@ def reduce_cardinality(series: pd.Series, max_levels: int = 15, min_freq: float 
     its categories are individually rare (e.g. REGION's "U.S. Service
     Schools") — those are real, meaningful categories, not noise from an
     oversized cardinality. Missing values are left as NaN, not folded into
-    'Other'."""
+    'Other'.
+
+    Gating on cardinality here assumes the column got here LEGITIMATELY
+    nominal — i.e. that classify_columns() didn't misroute a genuinely
+    continuous column into this path because an un-normalized text sentinel
+    (see load_raw()'s "PS" docstring) defeated its numeric-dtype check. For
+    a column like that, this function is precisely the mechanism that
+    destroys it: near-unique real values (each individually below
+    min_freq) all collapse into a single "Other" bucket, leaving a fake
+    2-or-3-level factor built entirely out of missingness structure rather
+    than the variable's actual meaning. Confirmed against real Scorecard
+    data — fix the sentinel at load time, not here."""
     counts = series.value_counts(dropna=True)
     if counts.shape[0] <= max_levels:
         return series
@@ -587,6 +666,14 @@ def classify_columns(df: pd.DataFrame) -> dict[str, list[str]]:
     as nominal is the version-stable way to catch a text column like
     ACCREDAGENCY without needing to enumerate every dtype name pandas might
     use for text.
+
+    This numeric-dtype check is also why load_raw() normalizing every
+    missing-value sentinel (see its docstring on the "PS" fix specifically)
+    matters so much: a genuinely continuous column that still has an
+    un-normalized text sentinel mixed into it reads as non-numeric here,
+    gets classified nominal, and then gets its information destroyed by
+    reduce_cardinality() below — not a hypothetical, confirmed against real
+    data for dozens of Scorecard's earnings/cohort-count columns.
     """
     ordinal_cols = [c for c in ORDINAL_ORDER if c in df.columns]
     applicable_flags = [f"{v}_APPLICABLE" for v in STRUCTURAL_NA if f"{v}_APPLICABLE" in df.columns]
