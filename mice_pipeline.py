@@ -60,6 +60,34 @@ N_DATASETS = 5              # M — number of completed datasets MICE produces
 N_ITERATIONS = 5            # MICE iterations per dataset
 RANDOM_STATE = 42
 
+# Speed lever, opt-in: by default, miceforest builds a separate LightGBM
+# model per variable-with-missing-values using EVERY OTHER surviving column
+# as a predictor (confirmed against miceforest's own source — see
+# build_variable_schema()'s docstring). That's fine at ~270 columns; it
+# stops being fine as column count grows, since per-variable training cost
+# scales with predictor count too, not just row count. Set this to an int
+# (e.g. 30) to cap each variable's predictor set to its N most-correlated
+# other columns via build_variable_schema() — lets you raise
+# COVERAGE_THRESHOLD/loosen the degenerate-column filters to keep MORE
+# columns without training cost blowing up per-model. None preserves
+# miceforest's default "everything predicts everything" behavior.
+MAX_PREDICTORS_PER_VARIABLE: int | None = None
+
+# LightGBM thread count for every model miceforest fits. -1 lets LightGBM
+# use all available cores — the default; this was hardcoded to 1 earlier
+# in this project specifically to rule out an OpenMP threading race as the
+# cause of the "access violation" native crash documented in
+# HANDOFF_MICE_CRASH_DEBUG.md. That crash's real causes turned out to be
+# two confirmed data/library bugs unrelated to threading — the "PS" sentinel
+# corrupting column classification (see load_raw()) and miceforest's
+# logodds() divide-by-zero for lopsided binary columns (see run_mice()) —
+# so single-threading is very likely no longer buying you anything but
+# lost speed. If a fixed run is stable, there's no remaining reason found
+# in this project's investigation to keep this at 1; revert to 1 only if
+# you see the exact "access violation" crash recur after both of those
+# fixes, as a bisection step.
+LGB_NUM_THREADS = -1
+
 # Set to False if you're pruning columns yourself upstream (e.g. in a
 # spreadsheet) and want to hand this script an already-trimmed CSV —
 # every other step still runs unconditionally on whatever columns arrive.
@@ -734,6 +762,60 @@ def finalize_dtypes(df: pd.DataFrame, columns: dict[str, list[str]]) -> pd.DataF
 # Step 5 — run MICE (miceforest)
 # ────────────────────────────────────────────────────────────────────────
 
+def build_variable_schema(df: pd.DataFrame, max_predictors: int | None) -> dict[str, list[str]] | None:
+    """Caps each variable-with-missing-values' predictor set to its
+    max_predictors most-correlated other columns, instead of miceforest's
+    default of every other column. Returns None (meaning "use miceforest's
+    default schema") if max_predictors is None — this function is a no-op
+    unless you've explicitly opted in via MAX_PREDICTORS_PER_VARIABLE.
+
+    Why this is a speed lever and not a correctness one, unlike the
+    equivalent step in mice_pipeline.R: LightGBM is tree-based — it doesn't
+    invert any matrix that a collinear or oversized predictor set could
+    make singular, so miceforest was never at risk of R's "computationally
+    singular" failure from a wide predictor set. What a wide predictor set
+    DOES cost here is pure training time: every one of the ~270+ variables'
+    LightGBM models has to consider every other surviving column as a
+    candidate split feature, for every one of N_ITERATIONS x N_DATASETS
+    fits. That cost scales with column count regardless of whether the
+    extra columns are actually informative for a given target — capping to
+    the columns most correlated with each specific target keeps each
+    individual model cheap even as you raise COVERAGE_THRESHOLD or loosen
+    the degenerate-column filters to keep more columns overall.
+
+    Only variables with actual missing values get a schema entry — matches
+    miceforest's own default behavior (confirmed against its source:
+    variable_schema=None trains models only for
+    ImputedData.vars_with_any_missing, using every other column as
+    predictors for each). Passing a schema that included fully-observed
+    columns as targets would change what gets modeled, not just how.
+    """
+    if max_predictors is None:
+        return None
+
+    targets = df.columns[df.isna().any()].tolist()
+
+    # Category dtype -> integer codes as a numeric stand-in for ranking
+    # correlation strength. This is a coarser signal than a true
+    # association measure for nominal columns (integer-coding an unordered
+    # category imposes an arbitrary order), but it only has to rank
+    # candidate predictors relative to each other for a speed cap, not
+    # produce a statistically meaningful correlation — good enough for
+    # that, and it's the same pragmatic approach used in mice_pipeline.R.
+    numeric_proxy = pd.DataFrame({
+        col: (df[col].cat.codes if df[col].dtype.name == "category" else df[col])
+        for col in df.columns
+    })
+    corr = numeric_proxy.corr(method="spearman", numeric_only=False).abs()
+    corr = corr.fillna(0.0)  # a constant column correlates as NaN (0/0), not a real 0 — treat as uninformative
+
+    schema = {}
+    for target in targets:
+        others = [c for c in df.columns if c != target]
+        ranked = corr.loc[target, others].sort_values(ascending=False)
+        schema[target] = ranked.index[:max_predictors].tolist()
+    return schema
+
 def run_mice(df: pd.DataFrame, rank_maps: dict[str, dict], columns: dict[str, list[str]]):
     """Fits `N_DATASETS` chains of MICE for `N_ITERATIONS` iterations each
     via miceforest, then snaps imputed ordinal values back to the nearest
@@ -746,22 +828,68 @@ def run_mice(df: pd.DataFrame, rank_maps: dict[str, dict], columns: dict[str, li
     """
     import miceforest as mf  # deferred import: only required for this step
 
+    # mean_match_strategy="fast" for binary/nominal columns specifically —
+    # NOT a workaround, a structural fix. miceforest's default ("normal")
+    # mean-matching for any non-numeric target runs candidate/bachelor
+    # predicted probabilities through miceforest/utils.py's logodds():
+    #   odds_ratio = probability / (1 - probability); log(odds_ratio)
+    # A predicted probability of exactly 0.0 or 1.0 (routine for a lopsided
+    # binary column — confirmed against real data on BBRR1_FED_UG_DFLT,
+    # one of several BBRR default/discharge-rate columns that end up
+    # binary via the exactly-2-realized-values rule above once filtered
+    # down to a small surviving population) divides by zero. numpy doesn't
+    # raise Python's ZeroDivisionError for float division — it warns and
+    # returns inf — so the try/except around that division in miceforest's
+    # own source never actually fires; the inf instead propagates into a
+    # later "data must be finite" ValueError once something (e.g. the
+    # nearest-neighbor donor search) tries to use it.
+    #
+    # "fast" mean matching for a binary/categorical target dispatches to
+    # _mean_match_binary_fast/_mean_match_multiclass_fast instead, which
+    # select directly from the predicted probability (argmax, or sampled
+    # weighted by probability) and never call logodds() at all — this
+    # isn't "less likely to hit the bug," the code path that divides by
+    # zero is structurally unreachable for these columns once set. The
+    # trade-off, stated plainly: "fast" imputes a binary/nominal value from
+    # the model's own prediction directly rather than borrowing an actual
+    # observed donor row's value the way nearest-neighbor donor matching
+    # does for "normal"/continuous columns — a real behavioral difference,
+    # not a free lunch, but a standard, well-supported miceforest option
+    # for exactly this variable type, not a monkeypatch or a hack.
+    # Ordinal/continuous columns are untouched (left on the "normal"
+    # default) — modeled_numeric_columns never runs through logodds() in
+    # the first place (see _impute_with_predictions), so they were never
+    # at risk from this specific failure mode.
+    mean_match_strategy = {col: "fast" for col in columns["binary"] + columns["nominal"]}
+
+    # See build_variable_schema()'s docstring — None (the default) preserves
+    # miceforest's own default of every-other-column-as-predictor; set
+    # MAX_PREDICTORS_PER_VARIABLE to cap per-model training cost as you add
+    # columns back via COVERAGE_THRESHOLD/the degenerate-column filters.
+    variable_schema = build_variable_schema(df, MAX_PREDICTORS_PER_VARIABLE)
+
     kernel = mf.ImputationKernel(
         df,
         num_datasets=N_DATASETS,
         random_state=RANDOM_STATE,
+        mean_match_strategy=mean_match_strategy,
+        variable_schema=variable_schema,
     )
     # verbose=True: if anything ever crashes mid-run again, this prints which
     # dataset/iteration/variable it was on right before the crash — the
     # traceback alone doesn't say, since the failure happens inside
-    # LightGBM's C extension, past the point Python could report it.
-    # num_threads=1: LightGBM + OpenMP crashing with a null-pointer access
-    # violation under multithreading is a known failure mode on Windows/
-    # Anaconda in particular. If drop_degenerate_columns() doesn't fully
-    # resolve the crash, this is the next thing to try — slower, but a
-    # useful bisection step to confirm whether it's a threading race rather
-    # than a data problem. Safe to remove once you've confirmed it's stable.
-    kernel.mice(N_ITERATIONS, verbose=True, num_threads=1)
+    # LightGBM's C extension, past the point Python could report it. Costs
+    # negligible time next to a single model fit; leave it on unless the
+    # printed output itself becomes a bottleneck at very high column counts.
+    #
+    # num_threads=LGB_NUM_THREADS (-1 by default = all cores): see that
+    # constant's docstring — this was hardcoded to 1 earlier in this
+    # project to rule out a threading race as the cause of the access-
+    # violation crash. That crash's real causes (the "PS" sentinel and
+    # logodds() bugs, both now fixed) were unrelated to threading, so
+    # LightGBM's normal multi-core tree building was very likely the single
+    # largest unnecessary slowdown in every prior run of this pipeline.
+    kernel.mice(N_ITERATIONS, verbose=True, num_threads=LGB_NUM_THREADS)
 
     completed = []
     for i in range(N_DATASETS):
