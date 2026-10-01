@@ -46,6 +46,126 @@ one reviewed here ever does arrive pre-encoded), but for
 
 ---
 
+## How to run this pipeline
+
+Everything below is about `mice_pipeline.py`, the actual implementation of
+every rule in this doc. §1–§9 explain *why* the code does what it does;
+this section is just *how to invoke it*.
+
+### Dependencies
+
+`pandas` and `numpy` are needed for everything. `miceforest` (which pulls in
+`lightgbm`) is only needed for the actual MICE step — `pip install
+miceforest` — if you just want to inspect column classification/coverage
+without running MICE, `build_analysis_frame()` alone works without it.
+
+### Before the first run
+
+Open `mice_pipeline.py` and set these two paths near the top of the file to
+wherever they live on your machine:
+
+- `RAW_CSV` — the College Scorecard extract to run (flat or dotted naming
+  convention, either works — see the module docstring).
+- `DICTIONARY_CSV` — your local copy of `CollegeScorecardDataDictionary.csv`.
+
+Everything else has a working default; the config section below covers what
+each one does if you want to tune something.
+
+### Option A — run everything in one process
+
+```
+python mice_pipeline.py
+```
+
+Fine as long as it fits in memory — builds and runs an `ImputationKernel`
+with all `N_DATASETS` chains at once. Produces `completed_0.csv` through
+`completed_{N_DATASETS-1}.csv` in `OUTPUT_DIR`, plus the reports listed
+below.
+
+### Option B — chunked, one dataset per process (recommended if memory is tight)
+
+By default, miceforest holds *every* dataset's full working-data copy in
+memory simultaneously for the whole run, even though it only actively
+trains one dataset's models at a time — so `N_DATASETS=5` costs roughly 5x
+a single dataset's peak memory, all in one process. Running one dataset per
+process instead caps peak memory at roughly 1x, because exiting a process
+is what actually returns memory to the OS — restarting a long-lived Jupyter
+kernel between cells does not do this on its own.
+
+```
+python mice_pipeline.py 0
+python mice_pipeline.py 1
+python mice_pipeline.py 2
+python mice_pipeline.py 3
+python mice_pipeline.py 4
+```
+
+Each is a separate invocation (a real process each time, not five calls in
+one script) and writes its own `completed_{i}.csv` plus a
+`checkpoint_dataset_{i}.pkl`. **If one gets interrupted partway through**
+(killed, crashed, closed), just re-run the exact same command — it detects
+the checkpoint and resumes from the last completed iteration instead of
+starting that dataset over.
+
+After all `N_DATASETS` runs finish, confirm every piece landed before
+moving on to modeling:
+
+```python
+import mice_pipeline as mp
+mp.check_chunked_datasets()
+```
+
+### Run it as a script, not a notebook cell, for anything beyond quick inspection
+
+`kernel.mice(verbose=True)` prints per-variable progress — on a run this
+size that's thousands of lines. A Jupyter notebook's browser tab has to
+render and hold all of that in its DOM as the cell's output grows, which is
+a well-known way to exhaust a browser tab's memory on its own, independent
+of whether the underlying Python process has enough RAM. Running from a
+terminal (VSCode's integrated terminal is fine — the point is "a script,"
+not VSCode specifically) avoids this entirely, and is also required for
+Option B's memory benefit to actually materialize (see above). Calling
+`build_analysis_frame()` directly from a notebook to inspect coverage or
+classification before committing to a run is still fine — that step alone
+doesn't touch miceforest at all.
+
+### Config reference
+
+| Constant | What it controls |
+|---|---|
+| `COVERAGE_THRESHOLD` | Min non-missing share to keep a column (the "magic proportion" from earlier in this project). |
+| `N_DATASETS` | `M` — number of completed datasets MICE produces. |
+| `N_ITERATIONS` | MICE iterations per dataset (`maxit`). |
+| `RANDOM_STATE` | Base seed. Each chunked dataset uses `RANDOM_STATE + dataset_index` so the `M` chains aren't identical. |
+| `MAX_PREDICTORS_PER_VARIABLE` | `None` (default) = miceforest's own behavior, every other column predicts every variable. Set to an int to cap each variable to its N most-correlated other columns — a speed lever that matters as you raise `COVERAGE_THRESHOLD`/loosen the degenerate-column filters to keep more columns. |
+| `LGB_NUM_THREADS` | `-1` (default) = LightGBM uses all cores. Only drop to `1` if you're specifically bisecting a crash for a threading cause — see its docstring for why that's unlikely to be needed anymore. |
+| `DATASET_INDEX` | Alternative to the CLI argument for Option B — set this instead of passing a number on the command line if you prefer editing the file over typing an argument each time. A CLI argument always overrides this when both are present. |
+| `MICE_VERBOSE` | Whether MICE prints per-variable progress at all. |
+| `VERBOSE_PRINT_EVERY` | With `MICE_VERBOSE=True`, print only every Nth per-variable line (default 50) to cut browser-rendered output volume without losing crash-diagnosis fidelity — see its docstring for why `find_crashed_variable()` isn't affected by this. Set to `1` to print every line. |
+| `APPLY_COVERAGE_FILTER` | Set `False` if you're pruning columns yourself upstream and want every other step to just run on whatever arrives. |
+| `MIN_CATEGORY_COUNT` / `MIN_CATEGORY_FRACTION` | Floors for `drop_degenerate_columns` — a categorical column's 2nd-most-common category must clear both the absolute and relative floor or the column is dropped. |
+| `MAX_DOMINANT_VALUE_SHARE` | Ceiling for `drop_near_constant_continuous` — a numeric column where one value accounts for at least this share of rows is dropped. |
+| `METADATA_COLUMN_SUFFIXES` | Column-name suffixes (case-insensitive) treated as per-variable provenance metadata, set aside rather than modeled — see `split_metadata_columns()`. |
+
+### Output files (in `OUTPUT_DIR`)
+
+| File | What it is |
+|---|---|
+| `completed_0.csv` … `completed_{M-1}.csv` | The `M` completed datasets, `UNITID` as the first column — this is what `post_mice_modeling.py` reads. |
+| `checkpoint_dataset_{i}.pkl` | Option B only — a pickled, in-progress kernel for dataset `i`. Safe to delete once `completed_{i}.csv` exists. |
+| `mice_kernel.pkl` | Option A only — the full kernel after an all-at-once run, pickled with the standard `pickle` module (miceforest has no custom save/load method). |
+| `sparsity_report.csv` | Coverage for every MICE-candidate column, computed before `COVERAGE_THRESHOLD` filters anything — see §6. |
+| `dropped_for_coverage.csv`, `dropped_for_low_variance.json` | What got cut and why, before MICE ever ran. |
+| `column_classification.json` | Final ordinal/binary/nominal/continuous classification — also what an R port would read to reconstruct types (see `HANDOFF_MICE_CRASH_DEBUG.md` if that's ever relevant again). |
+| `metadata_columns.csv` | Only written if any `*_year_added`-style columns were found — set aside, not deleted, not modeled. |
+
+### Next step
+
+Once every `completed_{i}.csv` is present, see `README_POST_MICE_MODELING.md`
+for fitting models across the `M` completed datasets.
+
+---
+
 ## 0. Defensive check only — not needed for `Most-Recent-Cohorts-Institution.csv`
 
 Confirmed by direct inspection: this file is not one-hot encoded, so this
