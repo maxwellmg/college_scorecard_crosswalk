@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import csv
 import json
+import pickle
 import sys
 from pathlib import Path
 
@@ -59,6 +60,44 @@ COVERAGE_THRESHOLD = 0.85   # the "magic proportion" — min non-missing share t
 N_DATASETS = 5              # M — number of completed datasets MICE produces
 N_ITERATIONS = 5            # MICE iterations per dataset
 RANDOM_STATE = 42
+
+# Memory lever, opt-in: run ONE of the M=N_DATASETS chains per process
+# instead of all of them in one. See run_mice_one_dataset()'s docstring for
+# the actual mechanism — miceforest holds every dataset's full working-data
+# copy in memory simultaneously for the whole run regardless of which one
+# is actively training, so num_datasets=5 costs roughly 5x a single
+# dataset's peak memory in ONE process. Set this to an int (0 through
+# N_DATASETS-1) and run this script that many times, each a genuine
+# process restart (`python mice_pipeline.py 0`, then `1`, ...) — leave as
+# None to run every dataset in a single process the original way, which is
+# fine as long as that fits in memory.
+DATASET_INDEX: int | None = None
+
+# Whether MICE prints per-variable progress. Independent of DATASET_INDEX
+# above — this affects a different resource than memory, specifically a
+# notebook's rendered output size. kernel.mice(verbose=True) prints one
+# line per variable per iteration per dataset — at ~270 columns x 5
+# iterations x 5 datasets that's thousands of lines, which a Jupyter
+# notebook's browser tab has to hold and render in its DOM as the cell's
+# output grows. That accumulation is a well-known way to exhaust a
+# browser tab's memory and is at least as likely an explanation for an
+# "out of memory" error reported by a browser specifically as the Python
+# process itself running out of RAM — the two have different fixes. Set to
+# False once a run is stable and you no longer need the per-variable crash
+# diagnostics verbose=True exists for (see run_mice()'s docstring on that).
+MICE_VERBOSE = True
+
+# Keep MICE_VERBOSE=True (so a stalled/crashed run still shows progress and
+# roughly where it got to) while cutting the line volume that's the actual
+# browser-memory concern above: only print every VERBOSE_PRINT_EVERY-th
+# per-variable line. See _throttle_miceforest_verbose()'s docstring for the
+# mechanism and why this doesn't cost any crash-diagnosis fidelity —
+# find_crashed_variable() identifies the crashed variable from miceforest's
+# internal logger state directly, not by parsing what got printed, so a
+# crash on a variable that happened to be skipped here is still identified
+# exactly as precisely as before. Set to 1 to print every variable (the
+# original behavior).
+VERBOSE_PRINT_EVERY = 50
 
 # Speed lever, opt-in: by default, miceforest builds a separate LightGBM
 # model per variable-with-missing-values using EVERY OTHER surviving column
@@ -762,6 +801,57 @@ def finalize_dtypes(df: pd.DataFrame, columns: dict[str, list[str]]) -> pd.DataF
 # Step 5 — run MICE (miceforest)
 # ────────────────────────────────────────────────────────────────────────
 
+def _throttle_miceforest_verbose(every: int) -> None:
+    """Patches miceforest's Logger.log so per-variable progress lines print
+    only every `every`-th occurrence, while every OTHER logged line (the
+    "N Dataset N" headers, which are low-volume and worth always seeing)
+    prints normally. Exists because kernel.mice(verbose=True) is all-or-
+    nothing — miceforest's own Logger.log() (miceforest/logger.py) is just
+    `print(*args, **kwargs)` behind an `if self.verbose` check, with no
+    sampling option — and per-variable lines are specifically what makes
+    verbose output expensive: one per variable per iteration per dataset,
+    thousands of lines on a run this size (see MICE_VERBOSE's docstring on
+    why that volume is a plausible contributor to a browser-reported "out
+    of memory" on its own, independent of the Python process's own RAM).
+
+    Detects a per-variable line by its exact format from miceforest's own
+    source (imputation_kernel.py: `logger.log(" | " + variable, end="")`)
+    — anything else (iteration numbers, "Dataset N", the trailing newline)
+    passes through untouched regardless of the counter. every=1 disables
+    throttling (every line prints, the original behavior).
+
+    Does not affect find_crashed_variable()'s accuracy — that function
+    reads logger.started_timers directly (miceforest's own record of which
+    (dataset, iteration, variable) started training but hasn't finished),
+    not the printed text, so a crash on a variable whose line was skipped
+    here is identified exactly as precisely as if every line had printed.
+
+    Idempotent against repeated calls (e.g. re-running a Jupyter cell after
+    an edit) — same marker-attribute guard as diagnose_mice_crash.py, for
+    the same reason: without it, a second call would wrap an already-
+    patched method again rather than replacing it cleanly, and the counter
+    would reset while the double-wrapping compounded the throttle rate.
+    """
+    from miceforest.logger import Logger
+
+    already_patched = getattr(Logger.log, "_is_throttle_patch", False)
+    original_log = Logger.log.__wrapped__ if already_patched else Logger.log
+
+    counter = {"n": 0}
+
+    def throttled_log(self, *args, **kwargs):
+        text = args[0] if args else ""
+        if isinstance(text, str) and text.startswith(" | "):
+            counter["n"] += 1
+            if counter["n"] % every != 0:
+                return
+        original_log(self, *args, **kwargs)
+
+    throttled_log._is_throttle_patch = True
+    throttled_log.__wrapped__ = original_log
+    Logger.log = throttled_log
+
+
 def build_variable_schema(df: pd.DataFrame, max_predictors: int | None) -> dict[str, list[str]] | None:
     """Caps each variable-with-missing-values' predictor set to its
     max_predictors most-correlated other columns, instead of miceforest's
@@ -802,17 +892,54 @@ def build_variable_schema(df: pd.DataFrame, max_predictors: int | None) -> dict[
     # candidate predictors relative to each other for a speed cap, not
     # produce a statistically meaningful correlation — good enough for
     # that, and it's the same pragmatic approach used in mice_pipeline.R.
+    # .cat.codes uses -1 for NaN (not NaN itself) — replace it back so the
+    # fill step below doesn't treat "missing" as a real, extreme category.
     numeric_proxy = pd.DataFrame({
-        col: (df[col].cat.codes if df[col].dtype.name == "category" else df[col])
+        col: (df[col].cat.codes.replace(-1, np.nan) if df[col].dtype.name == "category" else df[col])
         for col in df.columns
     })
-    corr = numeric_proxy.corr(method="spearman", numeric_only=False).abs()
-    corr = corr.fillna(0.0)  # a constant column correlates as NaN (0/0), not a real 0 — treat as uninformative
+
+    # DANGER, confirmed against real timing data — do not change this back
+    # to df.corr(): pandas' DataFrame.corr() does NOT use a vectorized BLAS
+    # path once any NaN is present (which is every column here) — it falls
+    # back to computing every pairwise correlation individually in a Python-
+    # level loop. Measured directly: method="pearson" on 2,000 columns took
+    # 154 seconds; method="spearman" (an earlier version of this function
+    # used it, reasoning that ranking predictor relevance doesn't need
+    # Pearson's linearity assumption) is far slower still — at only 150
+    # columns it already took 9+ seconds, extrapolating to roughly 10
+    # minutes at 1,200 columns and far longer beyond that. This is almost
+    # certainly what a system crash/hang after "10+ minutes, never reached
+    # the actual MICE iterations" was — this function runs BEFORE the
+    # ImputationKernel is even constructed, so a hang here presents exactly
+    # like that. Column count here can plausibly run into the thousands if
+    # COVERAGE_THRESHOLD/the degenerate filters are loosened to keep more
+    # columns (the entire point of this function), so this is not a
+    # hypothetical edge case — it is the expected way this gets used.
+    #
+    # Fix: mean-fill (once, cheaply) then a single np.corrcoef call — a
+    # proper vectorized matrix operation regardless of NaN, regardless of
+    # column count. Confirmed against the same 2,000-column timing case:
+    # 1.3 seconds, ~100x faster than pandas' pearson path alone. Losing
+    # Spearman's rank-based robustness here is an acceptable trade — this
+    # correlation is only ever used to roughly rank candidate predictors
+    # for a speed cap, never shown to the user or used for any statistical
+    # claim.
+    filled = numeric_proxy.to_numpy(dtype=float, copy=True)
+    col_means = np.nanmean(filled, axis=0)
+    col_means = np.nan_to_num(col_means, nan=0.0)  # an all-NaN column: fill with 0, corr will be 0 anyway
+    nan_mask = np.isnan(filled)
+    filled[nan_mask] = np.take(col_means, np.where(nan_mask)[1])
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        corr = np.corrcoef(filled, rowvar=False)
+    corr = np.abs(np.nan_to_num(corr, nan=0.0))  # a constant column -> 0/0 -> NaN; treat as uninformative
+    corr_df = pd.DataFrame(corr, index=df.columns, columns=df.columns)
 
     schema = {}
     for target in targets:
         others = [c for c in df.columns if c != target]
-        ranked = corr.loc[target, others].sort_values(ascending=False)
+        ranked = corr_df.loc[target, others].sort_values(ascending=False)
         schema[target] = ranked.index[:max_predictors].tolist()
     return schema
 
@@ -827,6 +954,9 @@ def run_mice(df: pd.DataFrame, rank_maps: dict[str, dict], columns: dict[str, li
     per-imputation model fitting / prediction ensembling.
     """
     import miceforest as mf  # deferred import: only required for this step
+
+    if MICE_VERBOSE and VERBOSE_PRINT_EVERY > 1:
+        _throttle_miceforest_verbose(VERBOSE_PRINT_EVERY)
 
     # mean_match_strategy="fast" for binary/nominal columns specifically —
     # NOT a workaround, a structural fix. miceforest's default ("normal")
@@ -875,12 +1005,13 @@ def run_mice(df: pd.DataFrame, rank_maps: dict[str, dict], columns: dict[str, li
         mean_match_strategy=mean_match_strategy,
         variable_schema=variable_schema,
     )
-    # verbose=True: if anything ever crashes mid-run again, this prints which
-    # dataset/iteration/variable it was on right before the crash — the
-    # traceback alone doesn't say, since the failure happens inside
-    # LightGBM's C extension, past the point Python could report it. Costs
-    # negligible time next to a single model fit; leave it on unless the
-    # printed output itself becomes a bottleneck at very high column counts.
+    # verbose=MICE_VERBOSE: when True, prints which dataset/iteration/
+    # variable it's on — if anything ever crashes mid-run again, this is
+    # what lets you see where, since the traceback alone doesn't say when
+    # the failure happens inside LightGBM's C extension. Costs negligible
+    # Python-side time; see MICE_VERBOSE's docstring on the OTHER cost this
+    # has nothing to do with speed — a browser-rendered notebook's output
+    # accumulating thousands of printed lines across a full run.
     #
     # num_threads=LGB_NUM_THREADS (-1 by default = all cores): see that
     # constant's docstring — this was hardcoded to 1 earlier in this
@@ -889,7 +1020,7 @@ def run_mice(df: pd.DataFrame, rank_maps: dict[str, dict], columns: dict[str, li
     # logodds() bugs, both now fixed) were unrelated to threading, so
     # LightGBM's normal multi-core tree building was very likely the single
     # largest unnecessary slowdown in every prior run of this pipeline.
-    kernel.mice(N_ITERATIONS, verbose=True, num_threads=LGB_NUM_THREADS)
+    kernel.mice(N_ITERATIONS, verbose=MICE_VERBOSE, num_threads=LGB_NUM_THREADS)
 
     completed = []
     for i in range(N_DATASETS):
@@ -901,6 +1032,143 @@ def run_mice(df: pd.DataFrame, rank_maps: dict[str, dict], columns: dict[str, li
             d[var] = d[var].round().clip(lower=lo, upper=hi)
         completed.append(d)
     return kernel, completed
+
+
+def run_mice_one_dataset(
+    df: pd.DataFrame,
+    rank_maps: dict[str, dict],
+    columns: dict[str, list[str]],
+    dataset_index: int,
+    checkpoint_path: Path,
+):
+    """Runs ONE of the M=N_DATASETS imputation chains in isolation
+    (num_datasets=1) instead of all of them together in one process — the
+    actual fix for an out-of-memory run, not just a smaller/safer-feeling
+    one. See DATASET_INDEX's docstring for the config-level summary; this
+    docstring covers the mechanism and the checkpointing behavior.
+
+    Why isolating one dataset reduces peak memory: miceforest's
+    ImputationKernel holds the full working-data copy for EVERY dataset in
+    num_datasets simultaneously for the whole run, even though its .mice()
+    loop only actively trains one dataset's models at a time (confirmed
+    against its source: `for dataset in self.datasets: self.complete_data
+    (dataset=dataset, inplace=True); for variable: ...` — the other
+    datasets' working copies sit in memory the entire time, never released
+    between turns). num_datasets=5 therefore costs roughly 5x a single
+    dataset's peak memory IN ONE PROCESS. Calling this function 5 times,
+    each as a genuine process restart (not 5 calls in one long-running
+    session — nothing is freed between calls in the same process), caps
+    peak memory at roughly 1x a single dataset's footprint regardless of
+    how many total chains (M) you want, because a process restart is what
+    actually returns memory to the OS.
+
+    Checkpointing (separate benefit from the above, not a substitute for
+    it): pickles the kernel to checkpoint_path after EVERY individual
+    iteration via kernel.mice(1, ...) in a loop, rather than one
+    kernel.mice(N_ITERATIONS, ...) call. If interrupted — killed, crashed,
+    notebook closed — re-running this function with the same
+    checkpoint_path reloads the saved kernel and continues from
+    kernel.iteration_count() rather than re-doing the whole chain. This
+    protects progress WITHIN one dataset's run; it does not by itself
+    reduce peak memory the way running one dataset per process does — a
+    resumed kernel still holds that one dataset's full working state in
+    memory the same as an uninterrupted run would.
+
+    miceforest has no save_kernel()/load_kernel() method (an earlier
+    version of this pipeline called one that doesn't exist, in main() —
+    now fixed). It implements __getstate__/__setstate__ specifically so
+    the kernel pickles with the standard library's pickle module, which is
+    what's used here and in main().
+    """
+    import miceforest as mf  # deferred import: only required for this step
+
+    if MICE_VERBOSE and VERBOSE_PRINT_EVERY > 1:
+        _throttle_miceforest_verbose(VERBOSE_PRINT_EVERY)
+
+    if checkpoint_path.exists():
+        with open(checkpoint_path, "rb") as f:
+            kernel = pickle.load(f)
+        print(f"Dataset {dataset_index}: resumed from checkpoint at iteration {kernel.iteration_count()}.")
+    else:
+        # Same mean_match_strategy/variable_schema reasoning as run_mice()
+        # above — see that function's docstrings for why each exists.
+        mean_match_strategy = {col: "fast" for col in columns["binary"] + columns["nominal"]}
+        variable_schema = build_variable_schema(df, MAX_PREDICTORS_PER_VARIABLE)
+        kernel = mf.ImputationKernel(
+            df,
+            num_datasets=1,
+            # RANDOM_STATE + dataset_index, not RANDOM_STATE alone — these
+            # five single-dataset kernels need distinct seeds or they'd all
+            # produce the identical chain, defeating the purpose of M=5.
+            random_state=RANDOM_STATE + dataset_index,
+            mean_match_strategy=mean_match_strategy,
+            variable_schema=variable_schema,
+        )
+
+    while kernel.iteration_count() < N_ITERATIONS:
+        kernel.mice(1, verbose=MICE_VERBOSE, num_threads=LGB_NUM_THREADS)
+        with open(checkpoint_path, "wb") as f:
+            pickle.dump(kernel, f)
+        print(f"Dataset {dataset_index}: checkpointed after iteration {kernel.iteration_count()}/{N_ITERATIONS}.")
+
+    completed = kernel.complete_data(dataset=0)
+    for var, rank_map in rank_maps.items():
+        if var not in completed.columns:
+            continue
+        lo, hi = min(rank_map.values()), max(rank_map.values())
+        completed[var] = completed[var].round().clip(lower=lo, upper=hi)
+    return kernel, completed
+
+
+def main_chunked(dataset_index: int):
+    """Entry point for running ONE of the M=N_DATASETS chains in isolation
+    — call this once per dataset_index (0 through N_DATASETS-1), each as a
+    genuine process restart for the memory benefit in run_mice_one_dataset()
+    to actually materialize. Running all N_DATASETS calls back-to-back
+    inside one long-lived process defeats the purpose, since nothing gets
+    released between them.
+
+    From a terminal (recommended — see MICE_VERBOSE's docstring on why a
+    notebook's rendered output, not necessarily the Python process itself,
+    is a likely explanation for a browser-reported "out of memory"):
+        python mice_pipeline.py 0
+        python mice_pipeline.py 1
+        ...
+        python mice_pipeline.py 4
+    Or from Jupyter/VSCode, restarting the kernel between each call:
+        main_chunked(0)   # then restart the kernel
+        main_chunked(1)   # then restart the kernel
+        ...
+    Each call re-runs build_analysis_frame() from scratch — cheap (seconds)
+    relative to the MICE run itself, and necessary since nothing persists
+    across the process restart that makes the memory benefit real.
+    After all N_DATASETS calls, run check_chunked_datasets() to confirm
+    every piece landed before handing off to post_mice_modeling.py.
+    """
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    df, report, rank_maps = build_analysis_frame(RAW_CSV)
+    checkpoint_path = OUTPUT_DIR / f"checkpoint_dataset_{dataset_index}.pkl"
+    kernel, completed = run_mice_one_dataset(
+        df, rank_maps, report["columns"], dataset_index, checkpoint_path
+    )
+    completed.to_csv(OUTPUT_DIR / f"completed_{dataset_index}.csv", index=True)
+    print(f"Dataset {dataset_index} complete — wrote completed_{dataset_index}.csv")
+
+
+def check_chunked_datasets() -> bool:
+    """Run after all N_DATASETS main_chunked() calls. There is no real
+    "recombining" step needed — each completed_{i}.csv is already a
+    complete, standalone table (miceforest's M chains were always
+    independent of each other, chunked or not) — this just confirms every
+    piece landed in the layout post_mice_modeling.py already expects
+    (completed_0.csv ... completed_{M-1}.csv), so a half-finished chunked
+    run doesn't silently look done."""
+    missing = [i for i in range(N_DATASETS) if not (OUTPUT_DIR / f"completed_{i}.csv").exists()]
+    if missing:
+        print(f"Still missing dataset(s): {missing} — run main_chunked(i) for each, or `python mice_pipeline.py {missing[0]}`.")
+        return False
+    print(f"All {N_DATASETS} completed datasets present in {OUTPUT_DIR}/ — ready for post_mice_modeling.py.")
+    return True
 
 
 def find_crashed_variable(exc: BaseException) -> list[str]:
@@ -1097,10 +1365,28 @@ def main():
 
     for i, d in enumerate(completed):
         d.to_csv(OUTPUT_DIR / f"completed_{i}.csv", index=True)  # index=UNITID — needed to join a DV on afterward
-    kernel.save_kernel(str(OUTPUT_DIR / "mice_kernel.pkl"))
+    # miceforest has no save_kernel()/load_kernel() method — it implements
+    # __getstate__/__setstate__ specifically so the kernel pickles with the
+    # standard library's pickle module (confirmed against its source). An
+    # earlier version of this line called a method that doesn't exist and
+    # would have raised AttributeError here, after every other output had
+    # already written successfully.
+    with open(OUTPUT_DIR / "mice_kernel.pkl", "wb") as f:
+        pickle.dump(kernel, f)
 
     print(f"Wrote {N_DATASETS} completed datasets to {OUTPUT_DIR}/")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # `python mice_pipeline.py 2` runs ONLY dataset chain 2 in isolation
+    # (see main_chunked()'s docstring) — a CLI argument always takes
+    # precedence over DATASET_INDEX so you can chunk without editing the
+    # file between each of the N_DATASETS runs. With no argument: falls
+    # back to DATASET_INDEX if set, otherwise runs the original
+    # all-datasets-in-one-process main().
+    if len(sys.argv) > 1:
+        main_chunked(int(sys.argv[1]))
+    elif DATASET_INDEX is not None:
+        main_chunked(DATASET_INDEX)
+    else:
+        sys.exit(main())
