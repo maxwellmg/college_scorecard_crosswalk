@@ -56,6 +56,15 @@ DICTIONARY_CSV = "CollegeScorecardDataDictionary.csv"
 
 OUTPUT_DIR = Path("mice_output")
 
+# UNITID -> INSTNM lookup, built once and left alone after that. INSTNM
+# (the actual school name) is deliberately excluded from the modeling
+# pipeline itself (see ALWAYS_EXCLUDE) — a free-text institution name has
+# no business being a MICE predictor or target. This table is the
+# supported way to get names back for human review: merge it onto
+# completed_{i}.csv on UNITID after MICE finishes. Kept separate from the
+# modeling data on purpose, not merged in automatically here.
+REFERENCE_TABLE_PATH = Path("unitid_instnm_reference.csv")
+
 COVERAGE_THRESHOLD = 0.85   # the "magic proportion" — min non-missing share to keep a column
 N_DATASETS = 5              # M — number of completed datasets MICE produces
 N_ITERATIONS = 5            # MICE iterations per dataset
@@ -998,6 +1007,24 @@ def run_mice(df: pd.DataFrame, rank_maps: dict[str, dict], columns: dict[str, li
     # columns back via COVERAGE_THRESHOLD/the degenerate-column filters.
     variable_schema = build_variable_schema(df, MAX_PREDICTORS_PER_VARIABLE)
 
+    # miceforest does not reliably preserve a custom pandas Index (UNITID,
+    # set by load_raw()) across versions — confirmed one installed version
+    # of miceforest hard-asserts `isinstance(working_data.index, RangeIndex)`
+    # at kernel construction and would raise immediately on a UNITID-indexed
+    # df; a different installed version ran successfully but produced
+    # completed data with no UNITID at all, meaning it silently discarded a
+    # non-RangeIndex rather than erroring. Either way, the index is gone
+    # before MICE starts, not lost afterward — nothing downstream can
+    # "recombine" it back in. Fix: carry UNITID alongside as a plain array
+    # instead of relying on it surviving as the DataFrame's actual pandas
+    # Index. This is safe because complete_data() only ever copies
+    # self.working_data and fills missing values via
+    # `.loc[na_where, variable]` (confirmed against miceforest's source) —
+    # it never reorders rows, so reattaching by position after the fact is
+    # exact, not approximate.
+    unitids = df.index.to_numpy()
+    df = df.reset_index(drop=True)
+
     kernel = mf.ImputationKernel(
         df,
         num_datasets=N_DATASETS,
@@ -1030,6 +1057,8 @@ def run_mice(df: pd.DataFrame, rank_maps: dict[str, dict], columns: dict[str, li
                 continue
             lo, hi = min(rank_map.values()), max(rank_map.values())
             d[var] = d[var].round().clip(lower=lo, upper=hi)
+        d.index = unitids
+        d.index.name = "UNITID"
         completed.append(d)
     return kernel, completed
 
@@ -1085,6 +1114,16 @@ def run_mice_one_dataset(
     if MICE_VERBOSE and VERBOSE_PRINT_EVERY > 1:
         _throttle_miceforest_verbose(VERBOSE_PRINT_EVERY)
 
+    # See run_mice()'s matching comment for the full explanation — miceforest
+    # does not reliably preserve a custom pandas Index (UNITID) across
+    # versions, so it's carried alongside as a plain array and reattached by
+    # position afterward instead. Captured unconditionally, before the
+    # resume/fresh-start branch below, since build_analysis_frame() is
+    # deterministic — main_chunked() hands this function the same row order
+    # every time regardless of whether this call is resuming a checkpoint
+    # or starting fresh, so unitids stays valid either way.
+    unitids = df.index.to_numpy()
+
     if checkpoint_path.exists():
         with open(checkpoint_path, "rb") as f:
             kernel = pickle.load(f)
@@ -1095,7 +1134,7 @@ def run_mice_one_dataset(
         mean_match_strategy = {col: "fast" for col in columns["binary"] + columns["nominal"]}
         variable_schema = build_variable_schema(df, MAX_PREDICTORS_PER_VARIABLE)
         kernel = mf.ImputationKernel(
-            df,
+            df.reset_index(drop=True),
             num_datasets=1,
             # RANDOM_STATE + dataset_index, not RANDOM_STATE alone — these
             # five single-dataset kernels need distinct seeds or they'd all
@@ -1117,6 +1156,8 @@ def run_mice_one_dataset(
             continue
         lo, hi = min(rank_map.values()), max(rank_map.values())
         completed[var] = completed[var].round().clip(lower=lo, upper=hi)
+    completed.index = unitids
+    completed.index.name = "UNITID"
     return kernel, completed
 
 
@@ -1269,6 +1310,54 @@ def run_mice_with_retry(
 # Orchestration
 # ────────────────────────────────────────────────────────────────────────
 
+def ensure_reference_table(
+    raw_csv: str | Path, dictionary_csv: str | Path, path: Path | None = None
+) -> None:
+    """Builds the UNITID -> INSTNM lookup at `path` if one doesn't already
+    exist there; does nothing (not even a re-read of raw_csv) if it does.
+    Safe to call at the top of every run, including every one of the
+    N_DATASETS separate processes in Option B — it only ever does real work
+    once.
+
+    path defaults to None (resolved to the module-level REFERENCE_TABLE_PATH
+    below) rather than `= REFERENCE_TABLE_PATH` directly in the signature —
+    same reasoning as load_raw()'s dictionary_csv parameter, and caught by
+    the same mistake during this function's own testing: a plain default
+    like that is evaluated once, when the function is defined, so
+    reassigning REFERENCE_TABLE_PATH afterward would silently have no
+    effect on calls that rely on the default.
+
+    Peeks at just the header row to resolve column names (handles both the
+    flat convention and the dotted one the same way load_raw() does, via
+    build_dotted_to_flat()) rather than loading the full multi-thousand-
+    column file a second time just to pull two columns out of it.
+    """
+    if path is None:
+        path = REFERENCE_TABLE_PATH
+    if path.exists():
+        print(f"Reference table already exists at {path} — leaving it as-is.")
+        return
+
+    header = pd.read_csv(raw_csv, nrows=0).columns.tolist()
+    dotted_to_flat = build_dotted_to_flat(dictionary_csv)
+    flat_header = [dotted_to_flat.get(c, c) for c in header]
+
+    wanted = {"UNITID", "INSTNM"}
+    usecols = [orig for orig, flat in zip(header, flat_header) if flat in wanted]
+    if len(usecols) < 2:
+        print(f"WARNING: could not find both UNITID and INSTNM in {raw_csv} "
+              f"(found: {usecols}) — reference table not created.")
+        return
+
+    ref = pd.read_csv(raw_csv, usecols=usecols, na_values=["PrivacySuppressed", "NULL", "PS"])
+    ref = ref.rename(columns=dict(zip(usecols, [dotted_to_flat.get(c, c) for c in usecols])))
+    ref = ref[["UNITID", "INSTNM"]]
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ref.to_csv(path, index=False)
+    print(f"Created reference table ({len(ref)} institutions) at {path}.")
+
+
 def build_analysis_frame(
     raw_csv: str | Path | None = None,
     dictionary_csv: str | Path | None = None,
@@ -1283,6 +1372,11 @@ def build_analysis_frame(
     """
     if raw_csv is None:
         raw_csv = RAW_CSV
+    if dictionary_csv is None:
+        dictionary_csv = DICTIONARY_CSV
+
+    ensure_reference_table(raw_csv, dictionary_csv)
+
     df = load_raw(raw_csv, dictionary_csv)
 
     df, metadata_df, metadata_cols = split_metadata_columns(df)
