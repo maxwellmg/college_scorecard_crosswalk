@@ -40,7 +40,14 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from sklearn.base import clone
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.ensemble import (
+    BaggingClassifier,
+    BaggingRegressor,
+    GradientBoostingClassifier,
+    GradientBoostingRegressor,
+    RandomForestClassifier,
+    RandomForestRegressor,
+)
 from sklearn.linear_model import LassoCV, LinearRegression, LogisticRegressionCV
 from sklearn.metrics import (
     accuracy_score,
@@ -73,6 +80,12 @@ TASK_TYPE = "regression"
 TEST_SIZE = 0.2
 RANDOM_STATE = 42
 
+# Lasso-based feature selection, run once up front (Step 3.5, below) before
+# any of the models in the registries get fit. Set to False to skip it and
+# fit every model on the full one-hot feature set instead.
+LASSO_FEATURE_SELECTION = True
+LASSO_VOTE_THRESHOLD = 0.5   # keep a feature if its coefficient is nonzero in >= this fraction of the M lasso fits
+
 
 # ────────────────────────────────────────────────────────────────────────
 # Model registries — add/remove a model by editing these dicts, nothing
@@ -85,6 +98,8 @@ REGRESSION_MODELS = {
     "lasso": LassoCV(cv=5, random_state=RANDOM_STATE, max_iter=10_000),
     "svr_rbf": SVR(kernel="rbf"),
     "random_forest": RandomForestRegressor(n_estimators=300, random_state=RANDOM_STATE, n_jobs=-1),
+    "bagging": BaggingRegressor(n_estimators=300, random_state=RANDOM_STATE, n_jobs=-1),
+    "gradient_boosting": GradientBoostingRegressor(n_estimators=300, random_state=RANDOM_STATE),
 }
 
 CLASSIFICATION_MODELS = {
@@ -94,6 +109,8 @@ CLASSIFICATION_MODELS = {
     ),
     "svc_rbf": SVC(kernel="rbf", probability=True, random_state=RANDOM_STATE),
     "random_forest": RandomForestClassifier(n_estimators=300, random_state=RANDOM_STATE, n_jobs=-1),
+    "bagging": BaggingClassifier(n_estimators=300, random_state=RANDOM_STATE, n_jobs=-1),
+    "gradient_boosting": GradientBoostingClassifier(n_estimators=300, random_state=RANDOM_STATE),
 }
 
 
@@ -197,6 +214,65 @@ def build_train_test_matrices(
 
 
 # ────────────────────────────────────────────────────────────────────────
+# Step 3.5 — optional Lasso feature-selection pass: shrink the one-hot
+# feature set down before SVM/SVR/random forest/bagging/boosting ever see
+# it. This is separate from the "lasso" entry in the model registries above
+# — that one reports Lasso's own predictive score; this one just uses
+# Lasso's coefficient shrinkage to cut the feature count.
+# ────────────────────────────────────────────────────────────────────────
+
+def select_features_with_lasso(
+    X_train_list: list[pd.DataFrame],
+    y_train_list: list[pd.Series],
+    task_type: str,
+    vote_threshold: float,
+) -> list[str]:
+    """Fits an L1-penalized model (LassoCV for regression, L1 LogisticRegressionCV
+    for classification) separately on each of the M training sets — same
+    one-model-per-imputation pattern used everywhere else in this script —
+    and keeps a feature only if it got a nonzero coefficient in at least
+    `vote_threshold` of the M fits. This stability-selection-style vote is
+    safer than running Lasso on a single imputation (which could keep/drop
+    a feature depending on which imputation happened to be used) and smaller
+    than taking the union of nonzero features across all M fits.
+    """
+    n_datasets = len(X_train_list)
+    all_columns = X_train_list[0].columns
+    selected_counts = pd.Series(0, index=all_columns)
+
+    for X_tr, y_tr in zip(X_train_list, y_train_list):
+        X_scaled = StandardScaler().fit_transform(X_tr)
+        if task_type == "classification":
+            selector = LogisticRegressionCV(
+                cv=5, penalty="l1", solver="liblinear", max_iter=5_000, random_state=RANDOM_STATE
+            )
+        else:
+            selector = LassoCV(cv=5, random_state=RANDOM_STATE, max_iter=10_000)
+        selector.fit(X_scaled, y_tr)
+        nonzero = all_columns[np.abs(np.ravel(selector.coef_)) > 1e-10]
+        selected_counts.loc[nonzero] += 1
+
+    keep = selected_counts[selected_counts >= vote_threshold * n_datasets].index.tolist()
+    if not keep:
+        print("Lasso feature selection kept 0 features (regularization zeroed out everything) "
+              "— falling back to the full feature set.")
+        return list(all_columns)
+
+    print(f"Lasso feature selection: kept {len(keep)} of {len(all_columns)} features "
+          f"(nonzero in >= {vote_threshold:.0%} of {n_datasets} imputations).")
+    return keep
+
+
+def reduce_to_selected_features(
+    X_train_list: list[pd.DataFrame], X_test_list: list[pd.DataFrame], selected_features: list[str]
+) -> tuple[list[pd.DataFrame], list[pd.DataFrame]]:
+    return (
+        [X.loc[:, selected_features] for X in X_train_list],
+        [X.loc[:, selected_features] for X in X_test_list],
+    )
+
+
+# ────────────────────────────────────────────────────────────────────────
 # Step 4 — fit each model on each of the M datasets, ensemble predictions
 # ────────────────────────────────────────────────────────────────────────
 
@@ -279,6 +355,12 @@ def main():
     )
     print(f"Train: {len(train_idx)} institutions  |  Test: {len(test_idx)}  |  "
           f"Features after one-hot + alignment: {X_train_list[0].shape[1]}")
+
+    if LASSO_FEATURE_SELECTION:
+        selected_features = select_features_with_lasso(
+            X_train_list, y_train_list, TASK_TYPE, LASSO_VOTE_THRESHOLD
+        )
+        X_train_list, X_test_list = reduce_to_selected_features(X_train_list, X_test_list, selected_features)
 
     models = CLASSIFICATION_MODELS if TASK_TYPE == "classification" else REGRESSION_MODELS
     results = run_models_across_imputations(
