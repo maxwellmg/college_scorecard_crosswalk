@@ -130,13 +130,76 @@ CLASSIFICATION_MODELS = {
 
 
 # ────────────────────────────────────────────────────────────────────────
+# Step 0 — diagnostics: catch bad UNITID columns/files before pandas does,
+# with an error that actually says what's wrong
+# ────────────────────────────────────────────────────────────────────────
+
+def diagnose_completed_files(completed_dir: Path, n_datasets: int) -> None:
+    """Pre-flight check, run before anything else touches these files.
+    pandas' own error when index_col="UNITID" can't find that column
+    (ValueError: Index UNITID invalid) doesn't say what the header actually
+    contained, so this re-reads just the header first and raises a message
+    that does — catches a stray BOM, trailing whitespace, or case mismatch
+    (e.g. 'UNITID ', '\\ufeffUNITID', 'unitid') immediately, rather than
+    several steps later inside a stack trace from inside read_csv.
+
+    Also checks for duplicate UNITID values and for the M files disagreeing
+    on which institutions they contain — both would otherwise corrupt the
+    shared train/test split silently rather than raising anything: the rest
+    of this script assumes one row per UNITID and the same set of UNITIDs
+    in every one of the M datasets (see make_shared_split's docstring), so
+    either problem needs to be caught here, before it quietly produces
+    wrong results downstream instead of an error.
+    """
+    unitid_sets = []
+    for i in range(n_datasets):
+        path = completed_dir / f"completed_{i}.csv"
+        if not path.exists():
+            raise FileNotFoundError(f"{path} not found — check COMPLETED_DIR and N_DATASETS.")
+
+        header = pd.read_csv(path, nrows=0).columns.tolist()
+        if "UNITID" not in header:
+            raise ValueError(
+                f"{path.name}: no column named exactly 'UNITID' found.\n"
+                f"Actual columns: {header!r}\n"
+                f"Check for a stray BOM, trailing/leading whitespace, or case "
+                f"mismatch in the header (e.g. 'UNITID ', 'unitid', '\\ufeffUNITID')."
+            )
+
+        unitid = pd.read_csv(path, usecols=["UNITID"])["UNITID"]
+        dupes = unitid[unitid.duplicated(keep=False)]
+        if len(dupes):
+            example = dupes.unique()[:10].tolist()
+            raise ValueError(
+                f"{path.name}: {len(dupes)} rows share "
+                f"{len(dupes.unique())} duplicated UNITID values (e.g. {example}). "
+                f"A duplicated index breaks the shared train/test split (make_shared_split) "
+                f"and the feature alignment (align_feature_columns) silently rather than "
+                f"raising — dedupe or investigate before proceeding."
+            )
+        unitid_sets.append(set(unitid))
+
+    reference = unitid_sets[0]
+    for i, s in enumerate(unitid_sets[1:], start=1):
+        if s != reference:
+            only_in_0 = reference - s
+            only_in_i = s - reference
+            raise ValueError(
+                f"completed_0.csv and completed_{i}.csv don't contain the same set of "
+                f"institutions (ensembling across the M fits requires matched rows). "
+                f"{len(only_in_0)} UNITIDs only in file 0, {len(only_in_i)} only in file {i} "
+                f"(e.g. {list(only_in_0 or only_in_i)[:10]})."
+            )
+
+
+# ────────────────────────────────────────────────────────────────────────
 # Step 1 — load the M completed datasets, drop institutions missing the DV
 # ────────────────────────────────────────────────────────────────────────
 
 def load_completed_datasets(completed_dir: Path, n_datasets: int) -> list[pd.DataFrame]:
-    """Each completed_{i}.csv has UNITID as its first column (mice_pipeline.py
-    writes it with index=True) — read it back as the index so the same
-    institution lines up across all M datasets."""
+    """UNITID doesn't have to be the first column — index_col="UNITID" finds
+    it by name, not position — but it does need to be read back as the
+    index so the same institution lines up across all M datasets."""
     return [
         pd.read_csv(completed_dir / f"completed_{i}.csv", index_col="UNITID")
         for i in range(n_datasets)
@@ -368,6 +431,7 @@ def run_models_across_imputations(
 # ────────────────────────────────────────────────────────────────────────
 
 def main():
+    diagnose_completed_files(COMPLETED_DIR, N_DATASETS)
     completed = load_completed_datasets(COMPLETED_DIR, N_DATASETS)
     completed = drop_missing_dv(completed, DV_COLUMN)
 
