@@ -90,6 +90,15 @@ N_DATASETS = 5              # completed_0.csv .. completed_4.csv
 DV_COLUMN = "Risk Score Count"
 DV_RELATED_COLUMNS = ["Risk Score Count", "Risk Score"]
 
+# Some feature columns still have leftover NaNs (outside MICE's imputation
+# set) rather than every column being fully imputed. True drops any
+# institution with a missing value in any feature column — the UNION of
+# such institutions across all M completed_#.csv files, dropped from every
+# one of them, so all M stay aligned on the same institutions (see
+# drop_rows_with_missing_features). False leaves diagnose_completed_files'
+# hard failure in place instead, so a NaN can't reach a model silently.
+DROP_ROWS_WITH_MISSING_FEATURES = True
+
 # "regression" for a continuous DV (earnings, debt, a rate, ...), or
 # "classification" for a binary DV (0/1 outcome). Everything below switches
 # on this one flag — model registry, metrics, and ensembling all follow it.
@@ -163,7 +172,9 @@ CLASSIFICATION_MODELS = {
 # with an error that actually says what's wrong
 # ────────────────────────────────────────────────────────────────────────
 
-def diagnose_completed_files(completed_dir: Path, n_datasets: int, dv_related_columns: list[str]) -> None:
+def diagnose_completed_files(
+    completed_dir: Path, n_datasets: int, dv_related_columns: list[str], drop_rows_with_missing_features: bool
+) -> None:
     """Pre-flight check, run before anything else touches these files.
     pandas' own error when index_col="UNITID" can't find that column
     (ValueError: Index UNITID invalid) doesn't say what the header actually
@@ -185,8 +196,11 @@ def diagnose_completed_files(completed_dir: Path, n_datasets: int, dv_related_co
     always means a column sat outside mice_pipeline.py's imputation set
     (e.g. not listed in its MODEL_VARS, or passively derived from a column
     that was) — it'll otherwise reach a model as a bare, column-agnostic
-    "Input X contains NaN" from inside StandardScaler/LassoCV, so this lists
-    which columns and how many rows before any model gets anywhere near it.
+    "Input X contains NaN" from inside StandardScaler/LassoCV. With
+    drop_rows_with_missing_features=True (DROP_ROWS_WITH_MISSING_FEATURES in
+    config), this is reported as a note — load_completed_datasets +
+    drop_rows_with_missing_features will drop the affected institutions
+    automatically — rather than raised as fatal.
 
     Also flags duplicate UNITID values (load_completed_datasets dedupes
     these automatically — see dedupe_by_unitid — so this is reported as a
@@ -230,12 +244,20 @@ def diagnose_completed_files(completed_dir: Path, n_datasets: int, dv_related_co
                 f"  {col}: {n} missing ({n / len(df):.1%} of {len(df)} rows)"
                 for col, n in na_counts.items()
             )
-            raise ValueError(
-                f"{path.name}: {len(na_counts)} feature column(s) still have missing values:\n"
-                f"{listing}\n"
-                f"Every column in a completed_#.csv should be fully imputed — check whether "
-                f"these were included in mice_pipeline.py's imputation set."
-            )
+            if drop_rows_with_missing_features:
+                print(
+                    f"NOTE: {path.name}: {len(na_counts)} feature column(s) still have missing "
+                    f"values — affected institutions will be dropped automatically "
+                    f"(DROP_ROWS_WITH_MISSING_FEATURES=True):\n{listing}"
+                )
+            else:
+                raise ValueError(
+                    f"{path.name}: {len(na_counts)} feature column(s) still have missing values:\n"
+                    f"{listing}\n"
+                    f"Every column in a completed_#.csv should be fully imputed — check whether "
+                    f"these were included in mice_pipeline.py's imputation set, or set "
+                    f"DROP_ROWS_WITH_MISSING_FEATURES = True to drop these institutions instead."
+                )
 
         unitid = df["UNITID"]
         dupes = unitid[unitid.duplicated(keep=False)]
@@ -262,7 +284,7 @@ def diagnose_completed_files(completed_dir: Path, n_datasets: int, dv_related_co
 
 # ────────────────────────────────────────────────────────────────────────
 # Step 1 — load the M completed datasets (deduping by UNITID), drop
-# institutions missing the DV
+# institutions missing the DV or (optionally) any feature value
 # ────────────────────────────────────────────────────────────────────────
 
 def dedupe_by_unitid(df: pd.DataFrame) -> pd.DataFrame:
@@ -306,6 +328,31 @@ def drop_missing_dv(datasets: list[pd.DataFrame], dv_column: str) -> list[pd.Dat
     if n_missing:
         print(f"Dropped {n_missing} of {len(missing_mask)} institutions with no {dv_column!r} value.")
     keep_index = datasets[0].index[~missing_mask]
+    return [df.loc[keep_index] for df in datasets]
+
+
+def drop_rows_with_missing_features(
+    datasets: list[pd.DataFrame], dv_related_columns: list[str]
+) -> list[pd.DataFrame]:
+    """Drops any institution with a missing value in any feature column
+    (everything except dv_related_columns — a missing DV is drop_missing_dv's
+    job, not this one). An institution counts as affected if it's missing a
+    feature in ANY of the M datasets, even if the other M-1 are fine for it
+    — the union, not the intersection, is dropped from every one of the M
+    datasets, since make_shared_split and the per-fold loops elsewhere in
+    this script all require the same institutions to be present in every
+    one of the M datasets.
+    """
+    bad_ids = set()
+    for df in datasets:
+        feature_cols = [c for c in df.columns if c not in dv_related_columns]
+        bad_ids.update(df.index[df[feature_cols].isna().any(axis=1)])
+
+    if bad_ids:
+        print(f"Dropped {len(bad_ids)} institutions with a missing feature value in at least "
+              f"one imputation (DROP_ROWS_WITH_MISSING_FEATURES=True): {sorted(bad_ids)[:10]}"
+              f"{', ...' if len(bad_ids) > 10 else ''}")
+    keep_index = datasets[0].index[~datasets[0].index.isin(bad_ids)]
     return [df.loc[keep_index] for df in datasets]
 
 
@@ -727,9 +774,11 @@ def run_bootstrap_across_imputations(
 # ────────────────────────────────────────────────────────────────────────
 
 def main():
-    diagnose_completed_files(COMPLETED_DIR, N_DATASETS, DV_RELATED_COLUMNS)
+    diagnose_completed_files(COMPLETED_DIR, N_DATASETS, DV_RELATED_COLUMNS, DROP_ROWS_WITH_MISSING_FEATURES)
     completed = load_completed_datasets(COMPLETED_DIR, N_DATASETS)
     completed = drop_missing_dv(completed, DV_COLUMN)
+    if DROP_ROWS_WITH_MISSING_FEATURES:
+        completed = drop_rows_with_missing_features(completed, DV_RELATED_COLUMNS)
 
     train_idx, test_idx = make_shared_split(completed[0].index, TEST_SIZE, RANDOM_STATE)
     X_train_list, y_train_list, X_test_list, y_test_list = build_train_test_matrices(
