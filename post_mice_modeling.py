@@ -99,6 +99,14 @@ DV_RELATED_COLUMNS = ["Risk Score Count", "Risk Score"]
 # hard failure in place instead, so a NaN can't reach a model silently.
 DROP_ROWS_WITH_MISSING_FEATURES = True
 
+# Column names to drop entirely (not just the rows with a missing value in
+# them) before any missing-value checks or modeling — for a column that's
+# bad outright rather than just missing a few values, this keeps far more
+# institutions in play than DROP_ROWS_WITH_MISSING_FEATURES would for the
+# same column. A name not present in a given completed_#.csv is skipped
+# there without error.
+COLUMNS_TO_DROP: list[str] = []
+
 # "regression" for a continuous DV (earnings, debt, a rate, ...), or
 # "classification" for a binary DV (0/1 outcome). Everything below switches
 # on this one flag — model registry, metrics, and ensembling all follow it.
@@ -173,7 +181,11 @@ CLASSIFICATION_MODELS = {
 # ────────────────────────────────────────────────────────────────────────
 
 def diagnose_completed_files(
-    completed_dir: Path, n_datasets: int, dv_related_columns: list[str], drop_rows_with_missing_features: bool
+    completed_dir: Path,
+    n_datasets: int,
+    dv_related_columns: list[str],
+    drop_rows_with_missing_features: bool,
+    columns_to_drop: list[str],
 ) -> None:
     """Pre-flight check, run before anything else touches these files.
     pandas' own error when index_col="UNITID" can't find that column
@@ -189,9 +201,11 @@ def diagnose_completed_files(
     of what the header actually contained, same root cause as the UNITID
     case and just as easy to get from a stray typo/space/case mismatch.
 
-    Also checks every feature column (everything except UNITID and
+    Also checks every feature column (everything except UNITID,
     dv_related_columns — a missing DV is handled separately and on purpose,
-    by drop_missing_dv dropping that row) for leftover NaNs. A completed_#.csv
+    by drop_missing_dv dropping that row — and columns_to_drop, which get
+    dropped outright before modeling regardless of what's in them) for
+    leftover NaNs. A completed_#.csv
     implies MICE filled in every column, so a NaN surviving here almost
     always means a column sat outside mice_pipeline.py's imputation set
     (e.g. not listed in its MODEL_VARS, or passively derived from a column
@@ -236,7 +250,9 @@ def diagnose_completed_files(
 
         df = pd.read_csv(path)
 
-        feature_cols = [c for c in df.columns if c != "UNITID" and c not in dv_related_columns]
+        feature_cols = [
+            c for c in df.columns if c != "UNITID" and c not in dv_related_columns and c not in columns_to_drop
+        ]
         na_counts = df[feature_cols].isna().sum()
         na_counts = na_counts[na_counts > 0].sort_values(ascending=False)
         if len(na_counts):
@@ -312,6 +328,20 @@ def load_completed_datasets(completed_dir: Path, n_datasets: int) -> list[pd.Dat
         for i in range(n_datasets)
     ]
     return [dedupe_by_unitid(df) for df in datasets]
+
+
+def drop_configured_columns(datasets: list[pd.DataFrame], columns_to_drop: list[str]) -> list[pd.DataFrame]:
+    """Drops COLUMNS_TO_DROP entirely from every one of the M datasets. For
+    a column that's bad outright (not just missing a handful of values),
+    dropping the column keeps far more institutions in play than
+    drop_rows_with_missing_features would for that same column — this runs
+    first, before any missing-value handling, so a configured-bad column
+    never costs a row elsewhere in the pipeline.
+    """
+    present = [c for c in columns_to_drop if c in datasets[0].columns]
+    if present:
+        print(f"Dropping {len(present)} configured column(s) from every dataset: {present}")
+    return [df.drop(columns=present, errors="ignore") for df in datasets]
 
 
 def drop_missing_dv(datasets: list[pd.DataFrame], dv_column: str) -> list[pd.DataFrame]:
@@ -774,8 +804,11 @@ def run_bootstrap_across_imputations(
 # ────────────────────────────────────────────────────────────────────────
 
 def main():
-    diagnose_completed_files(COMPLETED_DIR, N_DATASETS, DV_RELATED_COLUMNS, DROP_ROWS_WITH_MISSING_FEATURES)
+    diagnose_completed_files(
+        COMPLETED_DIR, N_DATASETS, DV_RELATED_COLUMNS, DROP_ROWS_WITH_MISSING_FEATURES, COLUMNS_TO_DROP
+    )
     completed = load_completed_datasets(COMPLETED_DIR, N_DATASETS)
+    completed = drop_configured_columns(completed, COLUMNS_TO_DROP)
     completed = drop_missing_dv(completed, DV_COLUMN)
     if DROP_ROWS_WITH_MISSING_FEATURES:
         completed = drop_rows_with_missing_features(completed, DV_RELATED_COLUMNS)
