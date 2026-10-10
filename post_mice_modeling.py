@@ -163,14 +163,20 @@ CLASSIFICATION_MODELS = {
 # with an error that actually says what's wrong
 # ────────────────────────────────────────────────────────────────────────
 
-def diagnose_completed_files(completed_dir: Path, n_datasets: int) -> None:
+def diagnose_completed_files(completed_dir: Path, n_datasets: int, dv_related_columns: list[str]) -> None:
     """Pre-flight check, run before anything else touches these files.
     pandas' own error when index_col="UNITID" can't find that column
     (ValueError: Index UNITID invalid) doesn't say what the header actually
     contained, so this re-reads just the header first and raises a message
     that does — catches a stray BOM, trailing whitespace, or case mismatch
     (e.g. 'UNITID ', '\\ufeffUNITID', 'unitid') immediately, rather than
-    several steps later inside a stack trace from inside read_csv.
+    several steps later inside a stack trace from inside read_csv. The same
+    check runs for dv_related_columns (DV_COLUMN and whatever else it's
+    paired with, e.g. 'Risk Score'/'Risk Score Count') — those get looked
+    up with plain `df[col]` later (in drop_missing_dv / to_model_matrix),
+    which raises a bare `KeyError: 'Risk Score Count'` with no indication
+    of what the header actually contained, same root cause as the UNITID
+    case and just as easy to get from a stray typo/space/case mismatch.
 
     Also flags duplicate UNITID values (load_completed_datasets dedupes
     these automatically — see dedupe_by_unitid — so this is reported as a
@@ -193,6 +199,15 @@ def diagnose_completed_files(completed_dir: Path, n_datasets: int) -> None:
                 f"Actual columns: {header!r}\n"
                 f"Check for a stray BOM, trailing/leading whitespace, or case "
                 f"mismatch in the header (e.g. 'UNITID ', 'unitid', '\\ufeffUNITID')."
+            )
+
+        missing_dv_cols = [col for col in dv_related_columns if col not in header]
+        if missing_dv_cols:
+            raise ValueError(
+                f"{path.name}: column(s) {missing_dv_cols!r} from DV_COLUMN/DV_RELATED_COLUMNS "
+                f"not found.\nActual columns: {header!r}\n"
+                f"Check for a typo, trailing/leading whitespace, or case mismatch against "
+                f"DV_RELATED_COLUMNS in the config section."
             )
 
         unitid = pd.read_csv(path, usecols=["UNITID"])["UNITID"]
@@ -685,7 +700,7 @@ def run_bootstrap_across_imputations(
 # ────────────────────────────────────────────────────────────────────────
 
 def main():
-    diagnose_completed_files(COMPLETED_DIR, N_DATASETS)
+    diagnose_completed_files(COMPLETED_DIR, N_DATASETS, DV_RELATED_COLUMNS)
     completed = load_completed_datasets(COMPLETED_DIR, N_DATASETS)
     completed = drop_missing_dv(completed, DV_COLUMN)
 
