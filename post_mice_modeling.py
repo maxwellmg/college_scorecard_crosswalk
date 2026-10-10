@@ -178,6 +178,16 @@ def diagnose_completed_files(completed_dir: Path, n_datasets: int, dv_related_co
     of what the header actually contained, same root cause as the UNITID
     case and just as easy to get from a stray typo/space/case mismatch.
 
+    Also checks every feature column (everything except UNITID and
+    dv_related_columns — a missing DV is handled separately and on purpose,
+    by drop_missing_dv dropping that row) for leftover NaNs. A completed_#.csv
+    implies MICE filled in every column, so a NaN surviving here almost
+    always means a column sat outside mice_pipeline.py's imputation set
+    (e.g. not listed in its MODEL_VARS, or passively derived from a column
+    that was) — it'll otherwise reach a model as a bare, column-agnostic
+    "Input X contains NaN" from inside StandardScaler/LassoCV, so this lists
+    which columns and how many rows before any model gets anywhere near it.
+
     Also flags duplicate UNITID values (load_completed_datasets dedupes
     these automatically — see dedupe_by_unitid — so this is reported as a
     note, not an error) and checks for the M files disagreeing on which
@@ -210,7 +220,24 @@ def diagnose_completed_files(completed_dir: Path, n_datasets: int, dv_related_co
                 f"DV_RELATED_COLUMNS in the config section."
             )
 
-        unitid = pd.read_csv(path, usecols=["UNITID"])["UNITID"]
+        df = pd.read_csv(path)
+
+        feature_cols = [c for c in df.columns if c != "UNITID" and c not in dv_related_columns]
+        na_counts = df[feature_cols].isna().sum()
+        na_counts = na_counts[na_counts > 0].sort_values(ascending=False)
+        if len(na_counts):
+            listing = "\n".join(
+                f"  {col}: {n} missing ({n / len(df):.1%} of {len(df)} rows)"
+                for col, n in na_counts.items()
+            )
+            raise ValueError(
+                f"{path.name}: {len(na_counts)} feature column(s) still have missing values:\n"
+                f"{listing}\n"
+                f"Every column in a completed_#.csv should be fully imputed — check whether "
+                f"these were included in mice_pipeline.py's imputation set."
+            )
+
+        unitid = df["UNITID"]
         dupes = unitid[unitid.duplicated(keep=False)]
         if len(dupes):
             print(
