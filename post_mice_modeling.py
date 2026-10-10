@@ -28,7 +28,7 @@ Bayesian hierarchical treatment of the multiple-imputation + prediction
 problem. Everything below is a frequentist point-estimate/ensembling
 approach meant for a first accuracy-and-predictive-power pass.
 
-Dependencies: pandas, numpy, scikit-learn (`pip install scikit-learn`).
+Dependencies: pandas, numpy, scikit-learn, matplotlib (`pip install scikit-learn matplotlib`).
 Validated end-to-end against a synthetic stand-in for mice_pipeline.py's
 output (see the bottom of this file's test run in conversation) — not yet
 run against your actual completed_*.csv files, since this environment
@@ -37,8 +37,10 @@ doesn't have them.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from sklearn.base import clone
@@ -58,6 +60,7 @@ from sklearn.metrics import (
     mean_squared_error,
     r2_score,
     roc_auc_score,
+    roc_curve,
 )
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
@@ -101,6 +104,32 @@ RANDOM_STATE = 42
 LASSO_FEATURE_SELECTION = True
 LASSO_VOTE_THRESHOLD = 0.5   # keep a feature if its coefficient is nonzero in >= this fraction of the M lasso fits
 
+# Saves a model-comparison chart + a diagnostic plot for the best model to
+# COMPLETED_DIR as PNGs once every model has finished (Step 5, below).
+MAKE_PLOTS = True
+
+# A few roles from a validated, colorblind-safe default palette — just the
+# ones these plots need (one accent color; everything else is neutral ink/
+# gridlines), so there's no cycling through an arbitrary color list.
+PLOT_COLORS = {
+    "accent": "#2a78d6",
+    "ink": "#0b0b0b",
+    "muted": "#898781",
+    "grid": "#e1e0d9",
+}
+
+# At small N (e.g. ~78 institutions), a single 80/20 holdout test set is a
+# noisy, one-shot estimate — these two add cross-validated estimates that
+# use far more of the data per fit. Both reuse whichever feature set the
+# main holdout run above ended up with (post-Lasso-reduction, if enabled)
+# rather than re-running feature selection inside every fold — see
+# run_loocv_across_imputations' docstring for why that's a documented
+# simplification rather than a fully nested CV. Both can be slow at a lot
+# of models/imputations — turn either off if the runtime's a problem.
+RUN_LOOCV = True
+RUN_BOOTSTRAP = True
+N_BOOTSTRAP_ITERS = 200   # out-of-bag bootstrap replicates; runtime scales linearly with this
+
 
 # ────────────────────────────────────────────────────────────────────────
 # Model registries — add/remove a model by editing these dicts, nothing
@@ -143,13 +172,13 @@ def diagnose_completed_files(completed_dir: Path, n_datasets: int) -> None:
     (e.g. 'UNITID ', '\\ufeffUNITID', 'unitid') immediately, rather than
     several steps later inside a stack trace from inside read_csv.
 
-    Also checks for duplicate UNITID values and for the M files disagreeing
-    on which institutions they contain — both would otherwise corrupt the
-    shared train/test split silently rather than raising anything: the rest
-    of this script assumes one row per UNITID and the same set of UNITIDs
-    in every one of the M datasets (see make_shared_split's docstring), so
-    either problem needs to be caught here, before it quietly produces
-    wrong results downstream instead of an error.
+    Also flags duplicate UNITID values (load_completed_datasets dedupes
+    these automatically — see dedupe_by_unitid — so this is reported as a
+    note, not an error) and checks for the M files disagreeing on which
+    institutions they contain — that one IS still fatal, since ensembling
+    across the M fits requires the same institutions, in the same positions,
+    in every one of the M datasets (see make_shared_split's docstring), and
+    there's no sensible automatic fix for a genuine mismatch in membership.
     """
     unitid_sets = []
     for i in range(n_datasets):
@@ -169,13 +198,10 @@ def diagnose_completed_files(completed_dir: Path, n_datasets: int) -> None:
         unitid = pd.read_csv(path, usecols=["UNITID"])["UNITID"]
         dupes = unitid[unitid.duplicated(keep=False)]
         if len(dupes):
-            example = dupes.unique()[:10].tolist()
-            raise ValueError(
-                f"{path.name}: {len(dupes)} rows share "
-                f"{len(dupes.unique())} duplicated UNITID values (e.g. {example}). "
-                f"A duplicated index breaks the shared train/test split (make_shared_split) "
-                f"and the feature alignment (align_feature_columns) silently rather than "
-                f"raising — dedupe or investigate before proceeding."
+            print(
+                f"NOTE: {path.name} has {len(dupes)} rows across {len(dupes.unique())} "
+                f"duplicated UNITID values — the first occurrence of each will be kept "
+                f"and the rest dropped automatically when this file is loaded."
             )
         unitid_sets.append(set(unitid))
 
@@ -193,17 +219,35 @@ def diagnose_completed_files(completed_dir: Path, n_datasets: int) -> None:
 
 
 # ────────────────────────────────────────────────────────────────────────
-# Step 1 — load the M completed datasets, drop institutions missing the DV
+# Step 1 — load the M completed datasets (deduping by UNITID), drop
+# institutions missing the DV
 # ────────────────────────────────────────────────────────────────────────
+
+def dedupe_by_unitid(df: pd.DataFrame) -> pd.DataFrame:
+    """Drops rows with a duplicate UNITID index, keeping the first
+    occurrence. Left alone, a duplicated index label blows up row counts
+    wherever this script does `.loc[some_index]` (every matching row comes
+    back for each occurrence of a repeated label, in both the lookup and
+    the frame) — make_shared_split and align_feature_columns both rely on
+    one row per UNITID, so this collapses to that before either runs.
+    """
+    n_before = len(df)
+    df = df[~df.index.duplicated(keep="first")]
+    n_after = len(df)
+    if n_after < n_before:
+        print(f"Deduped {n_before - n_after} duplicate-UNITID rows (kept first occurrence).")
+    return df
+
 
 def load_completed_datasets(completed_dir: Path, n_datasets: int) -> list[pd.DataFrame]:
     """UNITID doesn't have to be the first column — index_col="UNITID" finds
     it by name, not position — but it does need to be read back as the
     index so the same institution lines up across all M datasets."""
-    return [
+    datasets = [
         pd.read_csv(completed_dir / f"completed_{i}.csv", index_col="UNITID")
         for i in range(n_datasets)
     ]
+    return [dedupe_by_unitid(df) for df in datasets]
 
 
 def drop_missing_dv(datasets: list[pd.DataFrame], dv_column: str) -> list[pd.DataFrame]:
@@ -296,6 +340,35 @@ def build_train_test_matrices(
         y_test_list.append(y.loc[test_idx])
     X_train_list, X_test_list = align_feature_columns(X_train_list, X_test_list)
     return X_train_list, y_train_list, X_test_list, y_test_list
+
+
+def build_full_matrices(
+    datasets: list[pd.DataFrame],
+    dv_column: str,
+    dv_related_columns: list[str],
+    feature_columns: list[str] | None = None,
+) -> tuple[list[pd.DataFrame], list[pd.Series]]:
+    """Same one-hot-encode-then-align process as build_train_test_matrices,
+    but over the full index rather than a train/test split — LOOCV and the
+    bootstrap (Step 5.5, below) each carve up these full matrices into many
+    different train/test partitions themselves, so they need the complete
+    feature matrix once rather than one fixed split of it.
+
+    feature_columns, when given, reindexes down to exactly that column set
+    (e.g. whatever select_features_with_lasso already picked for the main
+    holdout run) so LOOCV/bootstrap score the same feature space as the
+    holdout comparison rather than re-deriving their own.
+    """
+    X_list, y_list = [], []
+    for df in datasets:
+        X, y = to_model_matrix(df, dv_column, dv_related_columns)
+        X_list.append(X)
+        y_list.append(y)
+    all_cols = sorted(set().union(*(X.columns for X in X_list)))
+    X_list = [X.reindex(columns=all_cols, fill_value=0) for X in X_list]
+    if feature_columns is not None:
+        X_list = [X.reindex(columns=feature_columns, fill_value=0) for X in X_list]
+    return X_list, y_list
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -393,17 +466,20 @@ def run_models_across_imputations(
     X_test_list: list[pd.DataFrame],
     y_test_list: list[pd.Series],
     task_type: str,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, dict[str, np.ndarray]]:
     """For each model: fit on each of the M (X_train, y_train) pairs,
     predict on the matching X_test, then (a) average the M predictions and
     score that ensembled prediction against the shared y_test, and
     (b) score each of the M individual fits separately to report how much
     the metric moves across imputations — see the module docstring for why
-    both numbers are worth having."""
+    both numbers are worth having. Also returns each model's ensembled
+    prediction (not just its scores) — Step 5's diagnostic plot needs the
+    actual predicted values, not only the summary metrics in the table."""
     score_fn = score_classification if task_type == "classification" else score_regression
     y_test_reference = y_test_list[0]  # identical across all M by construction (same DV, same split)
 
     rows = []
+    ensembled_predictions = {}
     for name, estimator in models.items():
         per_imputation_preds = []
         per_imputation_scores = []
@@ -413,6 +489,7 @@ def run_models_across_imputations(
             per_imputation_scores.append(score_fn(y_te, pred))
 
         ensembled_pred = np.mean(per_imputation_preds, axis=0)
+        ensembled_predictions[name] = ensembled_pred
         ensembled_scores = score_fn(y_test_reference, ensembled_pred)
 
         per_imputation_df = pd.DataFrame(per_imputation_scores)
@@ -422,6 +499,183 @@ def run_models_across_imputations(
             row[f"per_imputation_{metric}_mean"] = per_imputation_df[metric].mean()
             row[f"per_imputation_{metric}_std"] = per_imputation_df[metric].std()
         rows.append(row)
+
+    return pd.DataFrame(rows).set_index("model"), ensembled_predictions
+
+
+# ────────────────────────────────────────────────────────────────────────
+# Step 5 — plots: a model-comparison chart across every metric, plus a
+# diagnostic plot for whichever model scored best
+# ────────────────────────────────────────────────────────────────────────
+
+def _style_axis(ax) -> None:
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_color(PLOT_COLORS["muted"])
+    ax.spines["bottom"].set_color(PLOT_COLORS["muted"])
+    ax.tick_params(colors=PLOT_COLORS["muted"])
+    ax.yaxis.grid(True, color=PLOT_COLORS["grid"], linewidth=0.8, zorder=0)
+    ax.set_axisbelow(True)
+
+
+def plot_model_comparison(results: pd.DataFrame, task_type: str, out_path: Path) -> None:
+    """One panel per metric, bars ranked by the ensembled score, with an
+    error bar showing the spread of the M per-imputation scores — the
+    imputation-sensitivity read described in the module docstring. Each
+    panel is a single series (one model's score per bar), so it gets one
+    accent color throughout rather than a categorical palette — there's no
+    second series here for color to distinguish.
+    """
+    metrics = ["r2", "rmse", "mae"] if task_type == "regression" else ["accuracy", "roc_auc", "f1"]
+    fig, axes = plt.subplots(1, len(metrics), figsize=(5 * len(metrics), 4.5))
+    for ax, metric in zip(axes, metrics):
+        ranked = results.sort_values(f"ensembled_{metric}", ascending=False)
+        ax.bar(
+            ranked.index,
+            ranked[f"ensembled_{metric}"],
+            yerr=ranked[f"per_imputation_{metric}_std"],
+            capsize=4,
+            color=PLOT_COLORS["accent"],
+            ecolor=PLOT_COLORS["muted"],
+        )
+        ax.set_title(metric.upper(), color=PLOT_COLORS["ink"])
+        ax.tick_params(axis="x", rotation=40)
+        for label in ax.get_xticklabels():
+            label.set_ha("right")
+        _style_axis(ax)
+    fig.suptitle("Model comparison — ensembled score ± per-imputation spread", color=PLOT_COLORS["ink"])
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"Saved model comparison plot to {out_path}")
+
+
+def plot_best_model_diagnostic(
+    best_model_name: str, y_true, y_pred: np.ndarray, task_type: str, out_path: Path
+) -> None:
+    """Predicted-vs-actual (regression) or an ROC curve (classification)
+    for whichever model came out on top by the primary metric — the
+    comparison chart above says how much better; this shows what its
+    predictions actually look like against the truth."""
+    fig, ax = plt.subplots(figsize=(5.5, 5.5))
+    if task_type == "classification":
+        fpr, tpr, _ = roc_curve(y_true, y_pred)
+        ax.plot(fpr, tpr, color=PLOT_COLORS["accent"], linewidth=2)
+        ax.plot([0, 1], [0, 1], color=PLOT_COLORS["muted"], linewidth=1, linestyle="--")
+        ax.set_xlabel("False positive rate", color=PLOT_COLORS["ink"])
+        ax.set_ylabel("True positive rate", color=PLOT_COLORS["ink"])
+        ax.set_title(f"ROC curve — {best_model_name}", color=PLOT_COLORS["ink"])
+    else:
+        ax.scatter(y_true, y_pred, color=PLOT_COLORS["accent"], alpha=0.6, s=28, edgecolor="none")
+        lo, hi = min(np.min(y_true), y_pred.min()), max(np.max(y_true), y_pred.max())
+        ax.plot([lo, hi], [lo, hi], color=PLOT_COLORS["muted"], linewidth=1, linestyle="--")
+        ax.set_xlabel("Actual", color=PLOT_COLORS["ink"])
+        ax.set_ylabel("Predicted", color=PLOT_COLORS["ink"])
+        ax.set_title(f"Predicted vs. actual — {best_model_name}", color=PLOT_COLORS["ink"])
+    _style_axis(ax)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"Saved best-model diagnostic plot to {out_path}")
+
+
+# ────────────────────────────────────────────────────────────────────────
+# Step 5.5 — LOOCV and out-of-bag bootstrap: more data-efficient evaluation
+# for a small N (e.g. ~78 institutions), where the single 80/20 holdout
+# above is a noisy, one-shot estimate. Both work over the full feature
+# matrices from build_full_matrices and ensemble across the M imputations
+# the same way as everywhere else in this script.
+# ────────────────────────────────────────────────────────────────────────
+
+def run_loocv_across_imputations(
+    models: dict,
+    X_list: list[pd.DataFrame],
+    y_list: list[pd.Series],
+    task_type: str,
+) -> pd.DataFrame:
+    """Leave-one-out CV: for each institution, fit on the other N-1 (once
+    per imputation), average the M predictions for that one held-out
+    institution, then move on. At N~78 this trains on ~98.7% of the data
+    per fit, vs. 80% for the holdout split — the tradeoff is one prediction
+    per fold rather than many, so there's no per-fold score to report (a
+    single point has no R²/accuracy); only the pooled score across all N
+    held-out predictions is reported here.
+
+    NOTE: this reuses whichever feature columns the caller passes in (the
+    main holdout run's post-Lasso-reduction feature set, by convention) for
+    every fold rather than re-running select_features_with_lasso inside
+    each one — a fully nested CV would redo feature selection per fold.
+    Skipping that here is a deliberate simplification for a first pass at
+    N=78 (78 refits of LassoCV per imputation, on top of everything else,
+    for a marginal rigor gain); it gives LOOCV's accuracy numbers a small
+    optimistic bias worth keeping in mind if they end up driving a decision.
+    """
+    index = X_list[0].index
+    score_fn = score_classification if task_type == "classification" else score_regression
+
+    rows = []
+    for name, estimator in models.items():
+        loo_preds = pd.Series(index=index, dtype=float)
+        for held_out in index:
+            train_idx = index.drop(held_out)
+            test_idx = [held_out]
+            per_imputation_preds = [
+                fit_predict_one(estimator, X.loc[train_idx], y.loc[train_idx], X.loc[test_idx], task_type)[0]
+                for X, y in zip(X_list, y_list)
+            ]
+            loo_preds.loc[held_out] = np.mean(per_imputation_preds)
+
+        y_true = y_list[0]  # identical across all M by construction
+        scores = score_fn(y_true, loo_preds)
+        rows.append({"model": name, **{f"loocv_{metric}": value for metric, value in scores.items()}})
+
+    return pd.DataFrame(rows).set_index("model")
+
+
+def run_bootstrap_across_imputations(
+    models: dict,
+    X_list: list[pd.DataFrame],
+    y_list: list[pd.Series],
+    task_type: str,
+    n_bootstrap: int,
+    random_state: int,
+) -> pd.DataFrame:
+    """Out-of-bag bootstrap: each iteration draws N institutions with
+    replacement (same draw shared across all M imputations, same pattern as
+    make_shared_split) as the training set — whichever institutions weren't
+    drawn at all (~37% of N on average) are that iteration's out-of-bag test
+    set. A model is fit on the draw once per imputation, the M predictions
+    for that iteration's OOB institutions are averaged, and the (true,
+    predicted) pairs are pooled across all n_bootstrap iterations before
+    scoring once at the end, rather than averaged per institution first.
+
+    This is the plain OOB bootstrap estimate, not the bias-corrected .632+
+    estimator (which additionally blends in the apparent/training error
+    with fixed weights) — a reasonable first pass, not the most refined
+    version of this if these numbers need to be tighter later.
+    """
+    rng = np.random.default_rng(random_state)
+    index = X_list[0].index
+    n = len(index)
+    score_fn = score_classification if task_type == "classification" else score_regression
+
+    rows = []
+    for name, estimator in models.items():
+        pooled_true, pooled_pred = [], []
+        for _ in range(n_bootstrap):
+            boot_idx = index[rng.integers(0, n, size=n)]
+            oob_idx = index.difference(boot_idx)
+            if len(oob_idx) == 0:
+                continue
+            per_imputation_preds = [
+                fit_predict_one(estimator, X.loc[boot_idx], y.loc[boot_idx], X.loc[oob_idx], task_type)
+                for X, y in zip(X_list, y_list)
+            ]
+            pooled_true.append(y_list[0].loc[oob_idx].to_numpy())
+            pooled_pred.append(np.mean(per_imputation_preds, axis=0))
+
+        scores = score_fn(np.concatenate(pooled_true), np.concatenate(pooled_pred))
+        rows.append({"model": name, **{f"bootstrap_{metric}": value for metric, value in scores.items()}})
 
     return pd.DataFrame(rows).set_index("model")
 
@@ -449,13 +703,49 @@ def main():
         X_train_list, X_test_list = reduce_to_selected_features(X_train_list, X_test_list, selected_features)
 
     models = CLASSIFICATION_MODELS if TASK_TYPE == "classification" else REGRESSION_MODELS
-    results = run_models_across_imputations(
+    results, ensembled_predictions = run_models_across_imputations(
         models, X_train_list, y_train_list, X_test_list, y_test_list, TASK_TYPE
     )
 
     pd.set_option("display.width", 120)
     print(results.round(4))
     results.to_csv(COMPLETED_DIR / "model_comparison.csv")
+
+    if MAKE_PLOTS:
+        plot_model_comparison(results, TASK_TYPE, COMPLETED_DIR / "model_comparison.png")
+        primary_metric = "roc_auc" if TASK_TYPE == "classification" else "r2"
+        best_model_name = results[f"ensembled_{primary_metric}"].idxmax()
+        plot_best_model_diagnostic(
+            best_model_name,
+            y_test_list[0],
+            ensembled_predictions[best_model_name],
+            TASK_TYPE,
+            COMPLETED_DIR / f"best_model_diagnostic_{best_model_name}.png",
+        )
+
+    if RUN_LOOCV or RUN_BOOTSTRAP:
+        feature_columns = X_train_list[0].columns.tolist()
+        X_full_list, y_full_list = build_full_matrices(completed, DV_COLUMN, DV_RELATED_COLUMNS, feature_columns)
+        n_institutions = len(X_full_list[0])
+
+    if RUN_LOOCV:
+        print(f"Running LOOCV: {n_institutions} folds x {N_DATASETS} imputations x {len(models)} models...")
+        t0 = time.perf_counter()
+        loocv_results = run_loocv_across_imputations(models, X_full_list, y_full_list, TASK_TYPE)
+        print(f"LOOCV done in {time.perf_counter() - t0:.1f}s")
+        print(loocv_results.round(4))
+        loocv_results.to_csv(COMPLETED_DIR / "loocv_results.csv")
+
+    if RUN_BOOTSTRAP:
+        print(f"Running OOB bootstrap: {N_BOOTSTRAP_ITERS} iterations x {N_DATASETS} imputations x "
+              f"{len(models)} models...")
+        t0 = time.perf_counter()
+        bootstrap_results = run_bootstrap_across_imputations(
+            models, X_full_list, y_full_list, TASK_TYPE, N_BOOTSTRAP_ITERS, RANDOM_STATE
+        )
+        print(f"Bootstrap done in {time.perf_counter() - t0:.1f}s")
+        print(bootstrap_results.round(4))
+        bootstrap_results.to_csv(COMPLETED_DIR / "bootstrap_results.csv")
 
 
 if __name__ == "__main__":
